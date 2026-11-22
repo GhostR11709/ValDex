@@ -1,6 +1,6 @@
 [package]
 name = "vivi-launch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 description = "Starts the ValDex catalog server, then the player window."
