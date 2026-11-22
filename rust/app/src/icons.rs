@@ -20,6 +20,9 @@ pub enum Glyph {
     VolumeOff,
     More,
     Close,
+    Minimize,
+    Maximize,
+    Restore,
     Settings,
 }
 
@@ -85,6 +88,12 @@ fn paths(glyph: Glyph) -> (&'static str, bool) {
         ),
         Glyph::More => (r#"<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>"#, false),
         Glyph::Close => (r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#, false),
+        Glyph::Minimize => (r#"<path d="M5 12h14"/>"#, false),
+        Glyph::Maximize => (r#"<rect x="4" y="4" width="16" height="16" rx="2"/>"#, false),
+        Glyph::Restore => (
+            r#"<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>"#,
+            false,
+        ),
         Glyph::Settings => (
             r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>"#,
             false,

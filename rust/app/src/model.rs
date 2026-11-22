@@ -247,16 +247,39 @@ pub enum Look {
     Night,
     Light,
     Purple,
+    Rose,
+    Ocean,
+    Forest,
+    Sunset,
+    Ink,
 }
 
 impl Look {
-    pub const ALL: [Look; 3] = [Look::Night, Look::Light, Look::Purple];
+    pub const ALL: [Look; 8] = [Look::Night, Look::Light, Look::Purple, Look::Rose, Look::Ocean, Look::Forest, Look::Sunset, Look::Ink];
 
     pub fn label(self) -> &'static str {
         match self {
             Look::Night => "Night",
             Look::Light => "Light",
             Look::Purple => "Purple",
+            Look::Rose => "Rose",
+            Look::Ocean => "Ocean",
+            Look::Forest => "Forest",
+            Look::Sunset => "Sunset",
+            Look::Ink => "Ink",
+        }
+    }
+
+    pub fn note(self) -> &'static str {
+        match self {
+            Look::Night => "The original pink and black.",
+            Look::Light => "A light page, same pink mark.",
+            Look::Purple => "Violet instead of pink.",
+            Look::Rose => "A warmer rose on black.",
+            Look::Ocean => "Deep water and a bright mark.",
+            Look::Forest => "Dark green and a leaf mark.",
+            Look::Sunset => "Orange over a late evening.",
+            Look::Ink => "Almost black, with a white mark.",
         }
     }
 }
@@ -286,6 +309,20 @@ pub struct Library {
     pub look: Look,
     #[serde(default)]
     pub resume: Option<Resume>,
+    #[serde(default = "sidebar_open")]
+    pub drawer: bool,
+    #[serde(default)]
+    pub above: bool,
+    #[serde(default = "usual_volume")]
+    pub volume: f32,
+}
+
+fn sidebar_open() -> bool {
+    true
+}
+
+fn usual_volume() -> f32 {
+    0.8
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -372,6 +409,9 @@ mod tests {
         let library: Library = serde_json::from_str(r#"{"likes":[]}"#).expect("library");
         assert_eq!(library.look, Look::Night);
         assert!(library.resume.is_none());
+        assert!(library.drawer);
+        assert!(!library.above);
+        assert_eq!(library.volume, 0.8);
     }
 
     #[test]

@@ -28,7 +28,6 @@ struct Paint {
     chip_bg: Color,
     chip_fg: Color,
     chip_hover: Color,
-    night: bool,
 }
 
 const UI: Font = Font::with_name("Segoe UI");
@@ -59,32 +58,44 @@ pub fn swatch(look: Look) -> Color {
         Look::Night => Color::from_rgb8(0x0b, 0x0b, 0x0e),
         Look::Light => Color::from_rgb8(0xf6, 0xf3, 0xf5),
         Look::Purple => Color::from_rgb8(0x7c, 0x5c, 0xff),
+        Look::Rose => Color::from_rgb8(0xff, 0x4f, 0x8b),
+        Look::Ocean => Color::from_rgb8(0x38, 0xbd, 0xf8),
+        Look::Forest => Color::from_rgb8(0x34, 0xd3, 0x99),
+        Look::Sunset => Color::from_rgb8(0xfb, 0x92, 0x3c),
+        Look::Ink => Color::from_rgb8(0xf4, 0xf4, 0xf5),
     }
 }
 
 pub fn mica(_theme: &Theme) -> container::Style {
     let colors = paint();
-    let gradient = if colors.night {
-        iced::gradient::Linear::new(2.4)
-            .add_stop(0.0, Color::from_rgba(1.0, 0.31, 0.55, 0.34))
-            .add_stop(0.38, Color::from_rgb8(0x0b, 0x0b, 0x0e))
-            .add_stop(1.0, Color::from_rgba(0.49, 0.36, 1.0, 0.28))
-    } else if current() == Look::Purple {
-        iced::gradient::Linear::new(2.4)
-            .add_stop(0.0, Color::from_rgba(0.49, 0.36, 1.0, 0.46))
-            .add_stop(0.4, Color::from_rgb8(0x0c, 0x0a, 0x14))
-            .add_stop(1.0, Color::from_rgba(0.49, 0.36, 1.0, 0.32))
-    } else {
-        iced::gradient::Linear::new(2.4)
-            .add_stop(0.0, Color::from_rgba(1.0, 0.31, 0.55, 0.20))
-            .add_stop(0.42, Color::from_rgb8(0xf6, 0xf3, 0xf5))
-            .add_stop(1.0, Color::from_rgba(0.49, 0.36, 1.0, 0.14))
-    };
     container::Style {
         text_color: Some(colors.fg),
-        background: Some(Background::Gradient(gradient.into())),
+        background: Some(Background::Gradient(backdrop(current()).into())),
         ..container::Style::default()
     }
+}
+
+pub fn sample(look: Look) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Gradient(backdrop(look).into())),
+        border: border::rounded(10.0),
+        ..container::Style::default()
+    }
+}
+
+fn backdrop(look: Look) -> iced::gradient::Linear {
+    let (top, mid, bottom) = match look {
+        Look::Night => (Color::from_rgba(1.0, 0.31, 0.55, 0.34), Color::from_rgb8(0x0b, 0x0b, 0x0e), Color::from_rgba(0.49, 0.36, 1.0, 0.28)),
+        Look::Light => (Color::from_rgba(1.0, 0.31, 0.55, 0.20), Color::from_rgb8(0xf6, 0xf3, 0xf5), Color::from_rgba(0.49, 0.36, 1.0, 0.14)),
+        Look::Purple => (Color::from_rgba(0.49, 0.36, 1.0, 0.46), Color::from_rgb8(0x0c, 0x0a, 0x14), Color::from_rgba(0.49, 0.36, 1.0, 0.32)),
+        Look::Rose => (Color::from_rgba(1.0, 0.25, 0.45, 0.52), Color::from_rgb8(0x14, 0x08, 0x0e), Color::from_rgba(1.0, 0.35, 0.55, 0.30)),
+        Look::Ocean => (Color::from_rgba(0.22, 0.75, 1.0, 0.42), Color::from_rgb8(0x07, 0x10, 0x18), Color::from_rgba(0.15, 0.35, 0.9, 0.36)),
+        Look::Forest => (Color::from_rgba(0.20, 0.86, 0.55, 0.38), Color::from_rgb8(0x07, 0x14, 0x0e), Color::from_rgba(0.10, 0.45, 0.32, 0.34)),
+        Look::Sunset => (Color::from_rgba(1.0, 0.48, 0.16, 0.46), Color::from_rgb8(0x14, 0x0c, 0x08), Color::from_rgba(0.9, 0.25, 0.45, 0.32)),
+        Look::Ink => (Color::from_rgba(1.0, 1.0, 1.0, 0.08), Color::from_rgb8(0x0a, 0x0a, 0x0c), Color::from_rgba(1.0, 1.0, 1.0, 0.05)),
+    };
+    let middle = if look == Look::Light { 0.42 } else if look == Look::Night { 0.38 } else { 0.4 };
+    iced::gradient::Linear::new(2.4).add_stop(0.0, top).add_stop(middle, mid).add_stop(1.0, bottom)
 }
 
 pub fn dot(color: Color) -> impl Fn(&Theme) -> container::Style {
@@ -167,6 +178,17 @@ pub fn ghost(theme: &Theme, status: button::Status) -> button::Style {
     button_style(None, colors.fg, 12.0, Some(colors.wash_mid))(theme, status)
 }
 
+pub fn caption_close(_theme: &Theme, status: button::Status) -> button::Style {
+    let colors = paint();
+    let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: if hot { Some(Background::Color(colors.accent)) } else { None },
+        text_color: if hot { colors.on_accent } else { colors.fg },
+        border: border::rounded(8.0),
+        ..button::Style::default()
+    }
+}
+
 pub fn play(theme: &Theme, status: button::Status) -> button::Style {
     let colors = paint();
     button_style(Some(colors.play_bg), colors.play_fg, 999.0, Some(colors.play_hover))(theme, status)
@@ -241,6 +263,11 @@ fn current() -> Look {
     match LOOK.load(Ordering::Relaxed) {
         1 => Look::Light,
         2 => Look::Purple,
+        3 => Look::Rose,
+        4 => Look::Ocean,
+        5 => Look::Forest,
+        6 => Look::Sunset,
+        7 => Look::Ink,
         _ => Look::Night,
     }
 }
@@ -250,6 +277,11 @@ fn code(look: Look) -> u8 {
         Look::Night => 0,
         Look::Light => 1,
         Look::Purple => 2,
+        Look::Rose => 3,
+        Look::Ocean => 4,
+        Look::Forest => 5,
+        Look::Sunset => 6,
+        Look::Ink => 7,
     }
 }
 
@@ -257,6 +289,11 @@ fn paint() -> Paint {
     match current() {
         Look::Light => light_paint(),
         Look::Purple => purple_paint(),
+        Look::Rose => rose_paint(),
+        Look::Ocean => ocean_paint(),
+        Look::Forest => forest_paint(),
+        Look::Sunset => sunset_paint(),
+        Look::Ink => ink_paint(),
         Look::Night => night_paint(),
     }
 }
@@ -285,7 +322,6 @@ fn night_paint() -> Paint {
         chip_bg: Color::WHITE,
         chip_fg: Color::BLACK,
         chip_hover: Color::from_rgb8(0xe8, 0xe8, 0xea),
-        night: true,
     }
 }
 
@@ -314,7 +350,6 @@ fn light_paint() -> Paint {
         chip_bg: ink,
         chip_fg: Color::WHITE,
         chip_hover: Color::from_rgb8(0x3d, 0x24, 0x30),
-        night: false,
     }
 }
 
@@ -324,7 +359,55 @@ fn purple_paint() -> Paint {
     colors.accent_soft = Color::from_rgba8(0x7c, 0x5c, 0xff, 0.85);
     colors.on_accent = Color::WHITE;
     colors.surface = Color::from_rgb8(0x1c, 0x16, 0x30);
-    colors.night = false;
+    colors
+}
+
+fn rose_paint() -> Paint {
+    let mut colors = night_paint();
+    colors.accent = Color::from_rgb8(0xff, 0x5c, 0x8a);
+    colors.accent_soft = Color::from_rgba8(0xff, 0x5c, 0x8a, 0.85);
+    colors.surface = Color::from_rgb8(0x30, 0x14, 0x1e);
+    colors
+}
+
+fn ocean_paint() -> Paint {
+    let mut colors = night_paint();
+    colors.accent = Color::from_rgb8(0x38, 0xbd, 0xf8);
+    colors.accent_soft = Color::from_rgba8(0x38, 0xbd, 0xf8, 0.85);
+    colors.on_accent = Color::from_rgb8(0x04, 0x10, 0x18);
+    colors.purple = Color::from_rgb8(0x7d, 0xd3, 0xfc);
+    colors.surface = Color::from_rgb8(0x10, 0x24, 0x33);
+    colors
+}
+
+fn forest_paint() -> Paint {
+    let mut colors = night_paint();
+    colors.accent = Color::from_rgb8(0x34, 0xd3, 0x99);
+    colors.accent_soft = Color::from_rgba8(0x34, 0xd3, 0x99, 0.85);
+    colors.on_accent = Color::from_rgb8(0x04, 0x20, 0x14);
+    colors.purple = Color::from_rgb8(0x6e, 0xe7, 0xb7);
+    colors.surface = Color::from_rgb8(0x10, 0x28, 0x1c);
+    colors
+}
+
+fn sunset_paint() -> Paint {
+    let mut colors = night_paint();
+    colors.accent = Color::from_rgb8(0xfb, 0x92, 0x3c);
+    colors.accent_soft = Color::from_rgba8(0xfb, 0x92, 0x3c, 0.85);
+    colors.on_accent = Color::from_rgb8(0x1c, 0x0c, 0x04);
+    colors.purple = Color::from_rgb8(0xfb, 0x71, 0x85);
+    colors.amber = Color::from_rgb8(0xfd, 0xba, 0x74);
+    colors.surface = Color::from_rgb8(0x2a, 0x16, 0x0e);
+    colors
+}
+
+fn ink_paint() -> Paint {
+    let mut colors = night_paint();
+    colors.accent = Color::from_rgb8(0xf4, 0xf4, 0xf5);
+    colors.accent_soft = Color::from_rgba8(0xf4, 0xf4, 0xf5, 0.85);
+    colors.on_accent = Color::from_rgb8(0x11, 0x11, 0x13);
+    colors.purple = Color::from_rgb8(0xa1, 0xa1, 0xaa);
+    colors.surface = Color::from_rgb8(0x16, 0x16, 0x1a);
     colors
 }
 
@@ -340,6 +423,8 @@ mod tests {
         assert_eq!(highlight(), Color::from_rgb8(0x7c, 0x5c, 0xff));
         apply(Look::Light);
         assert_eq!(fg(), Color::from_rgb8(0x1a, 0x0b, 0x12));
+        apply(Look::Ocean);
+        assert_eq!(highlight(), Color::from_rgb8(0x38, 0xbd, 0xf8));
         apply(Look::Night);
     }
 }

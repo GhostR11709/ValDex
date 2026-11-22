@@ -10,6 +10,7 @@ mod session;
 #[cfg(not(windows))]
 #[path = "session_stub.rs"]
 mod session;
+mod press;
 mod songfile;
 mod style;
 
@@ -18,10 +19,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use iced::alignment::{Horizontal, Vertical};
+use iced::animation::Easing;
 use iced::widget::image::Handle;
 use iced::widget::{button, column, container, mouse_area, row, scrollable, slider, stack, text, text_input};
-use iced::{ContentFit, Element, Fill, Font, Point, Rectangle, Subscription, Task, Theme, Vector};
+use iced::{Animation, ContentFit, Element, Fill, Font, Point, Rectangle, Subscription, Task, Theme, Vector};
+
+const DRAWER: f32 = 220.0;
+const QUEUE: f32 = 320.0;
 use model::{format_bytes, format_clock, format_duration, greeting_now, Card, Collection, Home, Kind, Library, Look, Resume, Search, Source, Track};
+use press::press;
 use output::Output;
 
 fn main() -> iced::Result {
@@ -30,6 +36,11 @@ fn main() -> iced::Result {
     let mut window = iced::window::Settings::default();
     window.size = iced::Size::new(1180.0, 760.0);
     window.min_size = Some(iced::Size::new(960.0, 640.0));
+    window.decorations = false;
+    #[cfg(windows)]
+    {
+        window.platform_specific.corner_preference = iced::window::settings::platform::CornerPreference::Round;
+    }
     window.icon = iced::window::icon::from_file_data(include_bytes!("../../../valdex-icon.png"), None).ok();
     iced::application(App::new, App::update, App::view)
         .title(App::title)
@@ -81,6 +92,14 @@ struct App {
     pending_seek: Option<f32>,
     restore_once: bool,
     resume_saved: Instant,
+    drawer: Animation<bool>,
+    queue_anim: Animation<bool>,
+    reveal: Animation<bool>,
+    above_anim: Animation<bool>,
+    above: bool,
+    frame: Instant,
+    window_id: Option<iced::window::Id>,
+    maximized: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +183,18 @@ enum Message {
     Kept,
     Theme(Look),
     OpenFolder,
+    ToggleAbove,
+    ClearSearches,
+    ToggleSidebar,
+    Frame(Instant),
+    Drag,
+    Minimize,
+    ToggleMaximize,
+    Close,
+    Maximized(bool),
+    Zoom,
+    Resize(iced::window::Direction),
+    Window(iced::window::Id),
 }
 
 impl App {
@@ -173,6 +204,9 @@ impl App {
         let catalog = library.catalog.unwrap_or(Source::Youtube);
         let look = library.look;
         let resume = library.resume.clone();
+        let drawer_open = library.drawer;
+        let above = library.above;
+        let volume = if library.volume.is_finite() { library.volume.clamp(0.0, 1.0) } else { 0.8 };
         style::apply(look);
         let mut app = Self {
             catalog,
@@ -198,7 +232,7 @@ impl App {
             queue_open: false,
             position: 0.0,
             seek_target: None,
-            volume: 0.8,
+            volume,
             muted: false,
             library,
             menu: None,
@@ -215,6 +249,14 @@ impl App {
             pending_seek: None,
             restore_once: false,
             resume_saved: Instant::now(),
+            drawer: slide(drawer_open, 360),
+            queue_anim: slide(false, 360),
+            reveal: slide(true, 280),
+            above_anim: slide(above, 220),
+            above,
+            frame: Instant::now(),
+            window_id: None,
+            maximized: false,
         };
         let resume_task = match resume {
             Some(saved) if !saved.queue.is_empty() => {
@@ -252,12 +294,16 @@ impl App {
         let keys = iced::event::listen_with(on_key);
         let pointer = iced::event::listen_raw(track_pointer);
         let media = iced::time::every(std::time::Duration::from_millis(150)).map(|_| Message::Media);
+        let window = iced::window::open_events().map(Message::Window);
+        let zoom = iced::window::resize_events().map(|_| Message::Zoom);
+        let mut parts = vec![keys, pointer, media, window, zoom];
         if self.audio.is_some() {
-            let tick = iced::time::every(std::time::Duration::from_millis(400)).map(|_| Message::Tick);
-            Subscription::batch([keys, pointer, media, tick])
-        } else {
-            Subscription::batch([keys, pointer, media])
+            parts.push(iced::time::every(std::time::Duration::from_millis(400)).map(|_| Message::Tick));
         }
+        if self.moving() {
+            parts.push(iced::window::frames().map(Message::Frame));
+        }
+        Subscription::batch(parts)
     }
 
     fn open_menu(&mut self, track: Track) {
@@ -280,6 +326,7 @@ impl App {
                 self.results = None;
                 self.home = None;
                 self.screen = Screen::Home;
+                self.nudge();
                 self.library.catalog = Some(source);
                 let _ = remote::save_library(&self.library);
                 self.load_home()
@@ -287,6 +334,7 @@ impl App {
             Message::Mood(filter) => {
                 self.mood = if self.mood == filter { String::new() } else { filter };
                 self.screen = Screen::Home;
+                self.nudge();
                 self.load_home()
             }
             Message::Query(query) => {
@@ -332,6 +380,7 @@ impl App {
             }
             Message::Go(screen) => {
                 self.screen = screen;
+                self.nudge();
                 self.hide_menu();
                 self.notice.clear();
                 self.page_error.clear();
@@ -422,6 +471,8 @@ impl App {
             Message::Volume(volume) => {
                 self.volume = volume;
                 self.muted = false;
+                self.library.volume = volume;
+                let _ = remote::save_library(&self.library);
                 if let Some(audio) = &self.audio {
                     audio.set_volume(volume);
                 }
@@ -463,6 +514,9 @@ impl App {
             }
             Message::Queue(open) => {
                 self.queue_open = open;
+                let at = Instant::now();
+                self.queue_anim.go_mut(open, at);
+                self.frame = at;
                 Task::none()
             }
             Message::Like(track) => {
@@ -568,6 +622,7 @@ impl App {
                 self.look = look;
                 self.library.look = look;
                 style::apply(look);
+                self.nudge();
                 let _ = remote::save_library(&self.library);
                 Task::none()
             }
@@ -577,7 +632,77 @@ impl App {
                 }
                 Task::none()
             }
+            Message::ToggleAbove => {
+                self.above = !self.above;
+                let at = Instant::now();
+                self.above_anim.go_mut(self.above, at);
+                self.frame = at;
+                self.library.above = self.above;
+                let _ = remote::save_library(&self.library);
+                self.place()
+            }
+            Message::ClearSearches => {
+                self.library.searches.clear();
+                self.notice = match remote::save_library(&self.library) {
+                    Ok(()) => "Search history cleared.".into(),
+                    Err(error) => error,
+                };
+                Task::none()
+            }
+            Message::ToggleSidebar => {
+                let at = Instant::now();
+                self.drawer.go_mut(!self.drawer.value(), at);
+                self.frame = at;
+                self.library.drawer = self.drawer.value();
+                let _ = remote::save_library(&self.library);
+                Task::none()
+            }
+            Message::Frame(at) => {
+                self.frame = at;
+                Task::none()
+            }
+            Message::Drag => self.command(iced::window::drag),
+            Message::Minimize => self.command(|id| iced::window::minimize(id, true)),
+            Message::ToggleMaximize => self.command(|id| iced::window::toggle_maximize(id).chain(iced::window::is_maximized(id).map(Message::Maximized))),
+            Message::Close => iced::exit(),
+            Message::Maximized(value) => {
+                self.maximized = value;
+                Task::none()
+            }
+            Message::Zoom => self.command(|id| iced::window::is_maximized(id).map(Message::Maximized)),
+            Message::Resize(direction) => self.command(move |id| iced::window::drag_resize(id, direction)),
+            Message::Window(id) => {
+                self.window_id = Some(id);
+                iced::window::is_maximized(id).map(Message::Maximized).chain(self.place())
+            }
         }
+    }
+
+    fn moving(&self) -> bool {
+        let at = self.frame;
+        self.drawer.is_animating(at) || self.queue_anim.is_animating(at) || self.reveal.is_animating(at) || self.above_anim.is_animating(at)
+    }
+
+    fn nudge(&mut self) {
+        let at = Instant::now();
+        self.reveal = slide(false, 280).go(true, at);
+        self.frame = at;
+    }
+
+    fn place(&self) -> Task<Message> {
+        let level = if self.above { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
+        self.command(move |id| iced::window::set_level(id, level))
+    }
+
+    fn command(&self, apply: impl Fn(iced::window::Id) -> Task<Message> + Send + 'static) -> Task<Message> {
+        match self.window_id {
+            Some(id) => apply(id),
+            None => iced::window::latest().and_then(apply),
+        }
+    }
+
+    fn drawer_width(&self) -> f32 {
+        self.drawer.interpolate(0.0, DRAWER, self.frame).clamp(0.0, DRAWER)
     }
 
     fn load_home(&mut self) -> Task<Message> {
@@ -627,6 +752,7 @@ impl App {
         };
         self.pending_card = Some(card.clone());
         self.screen = Screen::Collection;
+        self.nudge();
         self.collection = None;
         self.page_error.clear();
         self.page_status = format!("Opening {}…", card.title);
@@ -1008,18 +1134,18 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let body = row![self.sidebar(), hairline_vertical(), self.content()].height(Fill).width(Fill);
-        let middle = if self.queue_open {
-            row![body, self.queue_panel()].height(Fill).width(Fill)
-        } else {
-            body
-        };
+        let middle = self.middle();
         let shell = container(column![self.header(), self.chips(), hairline(), middle, hairline(), self.player()].spacing(0).width(Fill).height(Fill))
             .width(Fill)
             .height(Fill)
             .style(style::mica);
+        let chrome = if self.maximized {
+            shell.into()
+        } else {
+            stack([shell.into(), self.resize_border()]).width(Fill).height(Fill).into()
+        };
         let Some(track) = self.menu.as_ref() else {
-            return shell.into();
+            return chrome;
         };
         let anchor = self.menu_anchor;
         let popup = iced::widget::Float::new(self.track_menu(track))
@@ -1033,11 +1159,31 @@ impl App {
             })
             .translate(move |bounds, viewport| place_menu(anchor, bounds, viewport));
         let dismiss = mouse_area(iced::widget::Space::new().width(Fill).height(Fill)).on_press(Message::Dismiss);
-        stack([shell.into(), stack([dismiss.into(), popup.into()]).width(Fill).height(Fill).into()]).width(Fill).height(Fill).into()
+        stack([chrome, stack([dismiss.into(), popup.into()]).width(Fill).height(Fill).into()]).width(Fill).height(Fill).into()
+    }
+
+    fn middle(&self) -> Element<'_, Message> {
+        let width = self.queue_anim.interpolate(0.0, QUEUE, self.frame).clamp(0.0, QUEUE);
+        let stage = self.stage();
+        if width < 1.0 {
+            return stage;
+        }
+        let page = row![stage, iced::widget::Space::new().width(width).height(Fill)].width(Fill).height(Fill);
+        let shown = width;
+        let panel = iced::widget::Float::new(self.queue_panel()).translate(move |bounds, viewport| Vector::new(viewport.x + viewport.width - shown - bounds.x, 0.0));
+        stack([page.into(), panel.into()]).width(Fill).height(Fill).clip(true).into()
+    }
+
+    fn stage(&self) -> Element<'_, Message> {
+        let width = self.drawer_width();
+        let page = row![iced::widget::Space::new().width(width).height(Fill), self.content()].width(Fill).height(Fill);
+        let shift = if width < 1.0 { -DRAWER - 8.0 } else { width - DRAWER };
+        let drawer = iced::widget::Float::new(self.sidebar()).translate(move |_bounds, _viewport| Vector::new(shift, 0.0));
+        stack([page.into(), drawer.into()]).width(Fill).height(Fill).clip(true).into()
     }
 
     fn header(&self) -> Element<'_, Message> {
-        let word = row![mark(), text("ValDex").size(15).font(style::strong())].spacing(8).align_y(Vertical::Center);
+        let brand = row![mark(), text("ValDex").size(15).font(style::strong())].spacing(8).align_y(Vertical::Center);
         let search = text_input(&format!("Search {}", self.catalog.label()), &self.query)
             .on_input(Message::Query)
             .on_submit(Message::Submit)
@@ -1045,20 +1191,75 @@ impl App {
             .size(14)
             .style(style::search)
             .width(Fill);
-        container(
-            row![container(word).width(160), container(search).width(Fill).align_x(Horizontal::Center), iced::widget::Space::new().width(160)]
-                .width(Fill)
-                .align_y(Vertical::Center)
-                .padding([8, 16]),
-        )
+        let bar = row![self.menu_button(), brand, container(search).width(Fill), self.window_controls()]
+            .spacing(10)
+            .align_y(Vertical::Center)
+            .padding(pad(4.0, 8.0, 4.0, 10.0))
+            .width(Fill);
+        mouse_area(bar).on_press(Message::Drag).on_double_click(Message::ToggleMaximize).into()
+    }
+
+    fn menu_button(&self) -> Element<'_, Message> {
+        let open = self.drawer.interpolate(0.0, 1.0, self.frame).clamp(0.0, 1.0);
+        let middle = 8.0 + 8.0 * open;
+        let gap = 3.0 + open;
+        let bar = |width: f32| container(iced::widget::Space::new()).width(width).height(2.0).style(style::fill(style::fg(), 1.0));
+        let glyph = column![bar(16.0), bar(middle), bar(16.0)].spacing(gap).align_x(Horizontal::Center);
+        let icon = container(glyph).width(36.0).height(36.0).align_x(Horizontal::Center).align_y(Vertical::Center);
+        press(button(icon).on_press(Message::ToggleSidebar).padding(0).style(style::ghost))
+    }
+
+    fn window_controls(&self) -> Element<'_, Message> {
+        let color = style::fg();
+        let minimize = self.caption(icons::draw(icons::Glyph::Minimize, 14.0, color), Message::Minimize, false);
+        let zoom_glyph = if self.maximized { icons::Glyph::Restore } else { icons::Glyph::Maximize };
+        let zoom = self.caption(icons::draw(zoom_glyph, 14.0, color), Message::ToggleMaximize, false);
+        let close = self.caption(icons::draw(icons::Glyph::Close, 14.0, color), Message::Close, true);
+        row![minimize, zoom, close].spacing(2).into()
+    }
+
+    fn caption<'a>(&self, icon: Element<'a, Message>, message: Message, close: bool) -> Element<'a, Message> {
+        let icon = container(icon).width(40.0).height(32.0).align_x(Horizontal::Center).align_y(Vertical::Center);
+        let button = button(icon).on_press(message).padding(0);
+        press(if close { button.style(style::caption_close) } else { button.style(style::ghost) })
+    }
+
+    fn resize_border(&self) -> Element<'_, Message> {
+        const EDGE: f32 = 5.0;
+        const CORNER: f32 = 10.0;
+        let grip = |width: iced::Length, height: iced::Length, direction, cursor| {
+            mouse_area(iced::widget::Space::new().width(width).height(height)).on_press(Message::Resize(direction)).interaction(cursor)
+        };
+        column![
+            row![
+                grip(CORNER.into(), EDGE.into(), iced::window::Direction::NorthWest, iced::mouse::Interaction::ResizingDiagonallyDown),
+                grip(Fill, EDGE.into(), iced::window::Direction::North, iced::mouse::Interaction::ResizingVertically),
+                grip(CORNER.into(), EDGE.into(), iced::window::Direction::NorthEast, iced::mouse::Interaction::ResizingDiagonallyUp),
+            ]
+            .width(Fill),
+            row![
+                grip(EDGE.into(), Fill, iced::window::Direction::West, iced::mouse::Interaction::ResizingHorizontally),
+                iced::widget::Space::new().width(Fill).height(Fill),
+                grip(EDGE.into(), Fill, iced::window::Direction::East, iced::mouse::Interaction::ResizingHorizontally),
+            ]
+            .width(Fill)
+            .height(Fill),
+            row![
+                grip(CORNER.into(), EDGE.into(), iced::window::Direction::SouthWest, iced::mouse::Interaction::ResizingDiagonallyUp),
+                grip(Fill, EDGE.into(), iced::window::Direction::South, iced::mouse::Interaction::ResizingVertically),
+                grip(CORNER.into(), EDGE.into(), iced::window::Direction::SouthEast, iced::mouse::Interaction::ResizingDiagonallyDown),
+            ]
+            .width(Fill),
+        ]
         .width(Fill)
+        .height(Fill)
         .into()
     }
 
     fn chips(&self) -> Element<'_, Message> {
         let chips = Source::ALL.map(|source| {
             let button = button(text(source.label()).size(14)).on_press(Message::Catalog(source)).padding([6, 14]);
-            if source == self.catalog { button.style(style::chip_on) } else { button.style(style::chip_off) }.into()
+            press(if source == self.catalog { button.style(style::chip_on) } else { button.style(style::chip_off) })
         });
         container(row(chips).spacing(8).padding(pad(0.0, 16.0, 10.0, 16.0)).wrap()).width(Fill).into()
     }
@@ -1075,8 +1276,12 @@ impl App {
             self.nav(Screen::Recents, "Recently played", self.screen == Screen::Recents),
         ]
         .spacing(4);
-        let body = column![nav, iced::widget::Space::new().height(Fill), self.settings_nav()].spacing(4).padding(12).height(Fill);
-        container(body).width(220).height(Fill).into()
+        let body = column![nav, iced::widget::Space::new().height(Fill), self.settings_nav()]
+            .spacing(4)
+            .padding(12)
+            .width(DRAWER - 1.0)
+            .height(Fill);
+        row![body, hairline_vertical()].width(DRAWER).height(Fill).into()
     }
 
     fn settings_nav(&self) -> Element<'_, Message> {
@@ -1084,16 +1289,17 @@ impl App {
         let color = if on { style::fg() } else { style::muted() };
         let label = row![icons::draw(icons::Glyph::Settings, 16.0, color), text("Settings").size(14)].spacing(8).align_y(Vertical::Center);
         let button = button(label).on_press(Message::Go(Screen::Settings)).padding([8, 12]).width(Fill);
-        if on { button.style(style::nav_on) } else { button.style(style::nav_off) }.into()
+        press(if on { button.style(style::nav_on) } else { button.style(style::nav_off) })
     }
 
     fn nav<'a>(&'a self, screen: Screen, label: &'a str, on: bool) -> Element<'a, Message> {
         let button = button(text(label).size(14)).on_press(Message::Go(screen)).padding([8, 12]).width(Fill);
-        if on { button.style(style::nav_on) } else { button.style(style::nav_off) }.into()
+        press(if on { button.style(style::nav_on) } else { button.style(style::nav_off) })
     }
 
     fn content(&self) -> Element<'_, Message> {
-        let page = container(self.page()).padding(pad(8.0, 28.0, 24.0, 28.0)).width(Fill);
+        let drop = self.reveal.interpolate(18.0, 0.0, self.frame).clamp(0.0, 18.0);
+        let page = container(self.page()).padding(pad(8.0 + drop, 28.0, 24.0, 28.0)).width(Fill);
         scrollable(page).width(Fill).height(Fill).into()
     }
 
@@ -1130,27 +1336,57 @@ impl App {
     }
 
     fn settings_page(&self) -> Element<'_, Message> {
-        let choices = row(Look::ALL.map(|look| self.theme_choice(look))).spacing(8).wrap();
+        let choices = row(Look::ALL.map(|look| self.theme_choice(look))).spacing(10).wrap();
         let folder = remote::downloads_folder().display().to_string();
+        let searches = self.library.searches.len();
         column![
             text("Settings").size(32).font(style::strong()),
-            text("Theme").size(16).font(style::strong()),
+            text("Appearance").size(16).font(style::strong()),
+            text(self.look.note()).size(13).color(style::muted()),
             choices,
-            text("Downloads").size(16).font(style::strong()),
+            text("Window").size(16).font(style::strong()),
+            self.above_row(),
+            text("Library").size(16).font(style::strong()),
             text(folder).size(13).color(style::muted()).width(Fill),
-            button(text("Open folder").size(14)).on_press(Message::OpenFolder).padding([8, 14]).style(style::chip_on),
+            row![
+                press(button(text("Open folder").size(14)).on_press(Message::OpenFolder).padding([8, 14]).style(style::chip_on)),
+                press(button(text("Clear search history").size(14)).on_press(Message::ClearSearches).padding([8, 14]).style(style::chip_off)),
+            ]
+            .spacing(8)
+            .wrap(),
+            text(format!("{searches} saved searches. Volume stays where you left it.")).size(12).color(style::faint()).width(Fill),
         ]
         .spacing(12)
         .width(Fill)
         .into()
     }
 
+    fn above_row(&self) -> Element<'_, Message> {
+        let travel = self.above_anim.interpolate(0.0, 1.0, self.frame).clamp(0.0, 1.0);
+        let knob = container(text("")).width(14.0).height(14.0).style(style::dot(if self.above { style::on_accent() } else { style::fg() }));
+        let track = container(row![iced::widget::Space::new().width(3.0 + 18.0 * travel).height(14.0), knob].align_y(Vertical::Center))
+            .width(40.0)
+            .height(22.0)
+            .align_y(Vertical::Center)
+            .clip(true)
+            .style(style::fill(if self.above { style::highlight() } else { style::faint() }, 11.0));
+        let switch = press(button(track).on_press(Message::ToggleAbove).padding(0).style(style::ghost));
+        row![
+            column![text("Stay on top").size(14).font(style::strong()), text("Keep ValDex above other windows.").size(12).color(style::muted())].spacing(2).width(Fill),
+            switch,
+        ]
+        .align_y(Vertical::Center)
+        .width(Fill)
+        .into()
+    }
+
     fn theme_choice(&self, look: Look) -> Element<'_, Message> {
         let on = self.look == look;
-        let swatch = container(text("")).width(14).height(14).style(style::dot(style::swatch(look)));
-        let label = row![swatch, text(look.label()).size(14)].spacing(8).align_y(Vertical::Center);
-        let button = button(label).on_press(Message::Theme(look)).padding([8, 14]);
-        if on { button.style(style::chip_on) } else { button.style(style::chip_off) }.into()
+        let preview = container(text("")).width(108.0).height(52.0).style(style::sample(look));
+        let mark = container(text("")).width(8.0).height(8.0).style(style::dot(style::swatch(look)));
+        let body = column![preview, row![mark, text(look.label()).size(13).font(style::strong())].spacing(6).align_y(Vertical::Center)].spacing(8).width(108);
+        let button = button(body).on_press(Message::Theme(look)).padding(8);
+        press(if on { button.style(style::nav_on) } else { button.style(style::nav_off) })
     }
 
     fn error_block(&self) -> Element<'_, Message> {
@@ -1162,7 +1398,7 @@ impl App {
         column![
             text(title).size(28).font(style::strong()),
             text(&self.page_error).size(14).color(style::muted()),
-            button(text("Try again").size(14)).on_press(Message::Retry).padding([8, 14]).style(style::chip_on),
+            press(button(text("Try again").size(14)).on_press(Message::Retry).padding([8, 14]).style(style::chip_on)),
         ]
         .spacing(8)
         .into()
@@ -1181,7 +1417,7 @@ impl App {
                     .iter()
                     .map(|filter| {
                         let button = button(text(filter).size(14)).on_press(Message::Mood(filter.clone())).padding([6, 14]);
-                        if filter == &self.mood { button.style(style::chip_pink) } else { button.style(style::chip_off) }.into()
+                        press(if filter == &self.mood { button.style(style::chip_pink) } else { button.style(style::chip_off) })
                     })
                     .collect();
                 parts.push(row(filters).spacing(8).wrap().into());
@@ -1208,7 +1444,7 @@ impl App {
                     .library
                     .searches
                     .iter()
-                    .map(|item| button(chip_label(item)).on_press(Message::Query(item.clone())).padding([6, 14]).style(style::chip_off).into())
+                    .map(|item| press(button(chip_label(item)).on_press(Message::Query(item.clone())).padding([6, 14]).style(style::chip_off)))
                     .collect();
                 parts.push(row(chips).spacing(8).wrap().into());
             }
@@ -1261,7 +1497,7 @@ impl App {
                 SearchTab::Playlists => "Playlists",
             };
             let button = button(text(label).size(13)).on_press(Message::Tab(tab)).padding([5, 12]);
-            if tab == self.tab { button.style(style::chip_on) } else { button.style(style::chip_off) }.into()
+            press(if tab == self.tab { button.style(style::chip_on) } else { button.style(style::chip_off) })
         });
         row(chips).spacing(8).wrap().into()
     }
@@ -1323,7 +1559,7 @@ impl App {
         let tracks = collection.playable();
         let mut info = column![text(&collection.title).size(32).font(style::strong()), text(&collection.subtitle).size(14).color(style::muted())].spacing(8);
         if !tracks.is_empty() {
-            info = info.push(button(icons::draw(icons::Glyph::Play, 16.0, style::play_icon())).on_press(Message::PlayTrack(tracks.clone(), 0)).padding(10).style(style::play));
+            info = info.push(press(button(icons::draw(icons::Glyph::Play, 16.0, style::play_icon())).on_press(Message::PlayTrack(tracks.clone(), 0)).padding(10).style(style::play)));
         }
         column![
             row![self.cover(&collection.thumbnail, &collection.title, 112.0, 18.0), info].spacing(16).align_y(Vertical::Center),
@@ -1355,7 +1591,7 @@ impl App {
             mouse_area(self.cover(card.art(), &card.title, 160.0, 16.0)).on_press(open.clone()),
             row![
                 column![text(&card.title).size(14).font(style::strong()), text(subtitle).size(12).color(style::muted())].width(Fill).spacing(2),
-                button(icons::draw(icons::Glyph::Play, 14.0, style::play_icon())).on_press(play).padding(8).style(style::play),
+                press(button(icons::draw(icons::Glyph::Play, 14.0, style::play_icon())).on_press(play).padding(8).style(style::play)),
             ]
             .spacing(6)
             .align_y(Vertical::Center),
@@ -1390,14 +1626,18 @@ impl App {
         .width(Fill);
         let liked = self.liked(track);
         let open = self.menu.as_ref().is_some_and(|item| item.same(track));
-        let heart = button(icons::draw(if liked { icons::Glyph::HeartOn } else { icons::Glyph::Heart }, 18.0, if liked { style::highlight() } else { style::faint() }))
-            .on_press(Message::Like(track.clone()))
-            .padding(6)
-            .style(if liked { style::heart_on } else { style::heart_off });
-        let more = button(icons::draw(icons::Glyph::More, 18.0, if open { style::highlight() } else { style::fg() }))
-            .on_press(Message::Menu(track.clone()))
-            .padding(6)
-            .style(if open { style::chip_on } else { style::ghost });
+        let heart = press(
+            button(icons::draw(if liked { icons::Glyph::HeartOn } else { icons::Glyph::Heart }, 18.0, if liked { style::highlight() } else { style::faint() }))
+                .on_press(Message::Like(track.clone()))
+                .padding(6)
+                .style(if liked { style::heart_on } else { style::heart_off }),
+        );
+        let more = press(
+            button(icons::draw(icons::Glyph::More, 18.0, if open { style::highlight() } else { style::fg() }))
+                .on_press(Message::Menu(track.clone()))
+                .padding(6)
+                .style(if open { style::chip_on } else { style::ghost }),
+        );
         let tail = row![text(format_duration(track.duration)).size(12).color(style::faint()), heart, more].spacing(4).align_y(Vertical::Center);
         let row = row![container(mouse_area(main).on_press(Message::PlayTrack(list.to_vec(), index))).width(Fill), tail].spacing(8).align_y(Vertical::Center).width(Fill);
         container(row).padding([4, 6]).width(Fill).style(if active { style::row_on } else { style::row_off }).into()
@@ -1420,14 +1660,14 @@ impl App {
             self.menu_item("Play next", Message::PlayNext(track.clone())),
             self.menu_item("Add to queue", Message::Enqueue(track.clone())),
             self.menu_item(like, Message::Like(track.clone())),
-            download_button,
+            press(download_button),
         ]
         .spacing(2);
         container(items).width(220).padding(6).style(style::fill(style::surface(), 12.0)).into()
     }
 
     fn menu_item(&self, label: &str, message: Message) -> Element<'_, Message> {
-        button(text(label.to_string()).size(13)).on_press(message).padding([8, 10]).width(Fill).style(style::ghost).into()
+        press(button(text(label.to_string()).size(13)).on_press(message).padding([8, 10]).width(Fill).style(style::ghost))
     }
 
     fn track_cover(&self, track: &Track, size: f32, radius: f32) -> Element<'_, Message> {
@@ -1530,17 +1770,27 @@ impl App {
         let cover = self.now.as_ref().map(|track| self.track_cover(track, 48.0, 8.0)).unwrap_or_else(|| self.cover("", "", 48.0, 8.0));
         let title = self.now.as_ref().map(|track| track.title.clone()).unwrap_or_else(|| "Nothing playing".into());
         let artist = if !self.playback_error.is_empty() {
-            text(&self.playback_error).size(12).color(style::amber()).width(Fill)
+            text(&self.playback_error).size(12).color(style::amber()).width(Fill).wrapping(iced::widget::text::Wrapping::None)
         } else if !self.busy.is_empty() {
-            text(&self.busy).size(12).color(style::muted()).width(Fill)
+            text(&self.busy).size(12).color(style::muted()).width(Fill).wrapping(iced::widget::text::Wrapping::None)
         } else {
-            text(self.now.as_ref().map(|track| track.artist()).unwrap_or_else(|| "Pick a song from Home or Search".into())).size(12).color(style::muted()).width(Fill)
+            text(self.now.as_ref().map(|track| track.artist()).unwrap_or_else(|| "Pick a song from Home or Search".into()))
+                .size(12)
+                .color(style::muted())
+                .width(Fill)
+                .wrapping(iced::widget::text::Wrapping::None)
         };
-        let identity = row![cover, column![text(title).size(14).font(style::strong()).width(Fill), artist].width(Fill).spacing(2)].spacing(10).align_y(Vertical::Center).width(Fill);
+        let identity = container(
+            row![cover, column![text(title).size(14).font(style::strong()).width(Fill).wrapping(iced::widget::text::Wrapping::None), artist].width(Fill).spacing(2)]
+                .spacing(10)
+                .align_y(Vertical::Center),
+        )
+        .width(Fill)
+        .clip(true);
         let controls = row![
             self.control(icons::Glyph::Shuffle, Message::Shuffle, self.shuffle),
             self.control(icons::Glyph::Previous, Message::Previous, false),
-            button(icons::draw(if self.playing { icons::Glyph::Pause } else { icons::Glyph::Play }, 18.0, style::play_icon())).on_press(Message::Toggle).padding(12).style(style::play),
+            press(button(icons::draw(if self.playing { icons::Glyph::Pause } else { icons::Glyph::Play }, 18.0, style::play_icon())).on_press(Message::Toggle).padding(12).style(style::play)),
             self.control(icons::Glyph::Next, Message::Next, false),
             self.control(if self.repeat == Repeat::One { icons::Glyph::RepeatOne } else { icons::Glyph::Repeat }, Message::CycleRepeat, self.repeat != Repeat::Off),
         ]
@@ -1548,11 +1798,12 @@ impl App {
         .align_y(Vertical::Center);
         let liked = self.now.as_ref().is_some_and(|track| self.liked(track));
         let heart: Option<Element<'_, Message>> = self.now.as_ref().map(|track| {
-            button(icons::draw(if liked { icons::Glyph::HeartOn } else { icons::Glyph::Heart }, 18.0, if liked { style::highlight() } else { style::faint() }))
-                .on_press(Message::Like(track.clone()))
-                .padding(6)
-                .style(if liked { style::heart_on } else { style::heart_off })
-                .into()
+            press(
+                button(icons::draw(if liked { icons::Glyph::HeartOn } else { icons::Glyph::Heart }, 18.0, if liked { style::highlight() } else { style::faint() }))
+                    .on_press(Message::Like(track.clone()))
+                    .padding(6)
+                    .style(if liked { style::heart_on } else { style::heart_off }),
+            )
         });
         let volume = slider(0.0..=1.0, if self.muted { 0.0 } else { self.volume }, Message::Volume).step(0.01_f32).width(96).style(style::volume);
         let volume_icon = if self.muted || self.volume == 0.0 {
@@ -1573,13 +1824,14 @@ impl App {
         if let Some(heart) = heart {
             extras = extras.push(heart);
         }
-        let bar = row![identity, controls, extras].spacing(12).align_y(Vertical::Center).padding(pad(8.0, 16.0, 12.0, 16.0)).width(Fill);
+        let side = row![iced::widget::Space::new().width(Fill), extras].width(Fill).align_y(Vertical::Center);
+        let bar = row![identity, controls, side].spacing(12).align_y(Vertical::Center).padding(pad(8.0, 16.0, 12.0, 16.0)).width(Fill);
         container(column![seek, bar].spacing(6).width(Fill)).width(Fill).style(style::fill(style::bar(), 0.0)).into()
     }
 
     fn control(&self, glyph: icons::Glyph, message: Message, accent: bool) -> Element<'_, Message> {
         let color = if accent { style::highlight() } else { style::fg() };
-        button(icons::draw(glyph, 18.0, color)).on_press(message).padding(8).style(if accent { style::accent } else { style::ghost }).into()
+        press(button(icons::draw(glyph, 18.0, color)).on_press(message).padding(8).style(if accent { style::accent } else { style::ghost }))
     }
 
     fn queue_panel(&self) -> Element<'_, Message> {
@@ -1591,7 +1843,7 @@ impl App {
             let current = index == self.index && self.now.as_ref().is_some_and(|playing| playing.same(track));
             let line = row![
                 container(mouse_area(column![text(&track.title).size(13).color(if current { style::highlight() } else { style::fg() }), text(track.artist()).size(12).color(style::muted())].width(Fill).spacing(1)).on_press(Message::Jump(index))).width(Fill),
-                button(icons::draw(icons::Glyph::Close, 14.0, style::fg())).on_press(Message::Remove(index)).padding(4).style(style::ghost),
+                press(button(icons::draw(icons::Glyph::Close, 14.0, style::fg())).on_press(Message::Remove(index)).padding(4).style(style::ghost)),
             ]
             .spacing(6)
             .align_y(Vertical::Center);
@@ -1599,8 +1851,8 @@ impl App {
         }
         let header = row![
             column![text("Queue").size(16).font(style::strong()), text(format!("{} songs", self.queue.len())).size(12).color(style::muted())].spacing(2).width(Fill),
-            button(text("Clear").size(12)).on_press(Message::ClearUpcoming).padding([4, 8]).style(style::ghost),
-            button(text("Close").size(12)).on_press(Message::Queue(false)).padding([4, 8]).style(style::ghost),
+            press(button(text("Clear").size(12)).on_press(Message::ClearUpcoming).padding([4, 8]).style(style::ghost)),
+            press(button(text("Close").size(12)).on_press(Message::Queue(false)).padding([4, 8]).style(style::ghost)),
         ]
         .align_y(Vertical::Center)
         .padding(pad(12.0, 12.0, 4.0, 12.0));
@@ -1610,6 +1862,10 @@ impl App {
             .style(style::fill(style::bar(), 0.0))
             .into()
     }
+}
+
+fn slide(on: bool, millis: u64) -> Animation<bool> {
+    Animation::new(on).easing(if millis < 300 { Easing::EaseOutCubic } else { Easing::EaseInOutCubic }).duration(std::time::Duration::from_millis(millis))
 }
 
 fn pad(top: f32, right: f32, bottom: f32, left: f32) -> iced::Padding {

@@ -1,6 +1,6 @@
 [package]
 name = "vivi"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Native Windows player. Catalogs that are not ported yet still come from the Next.js server."
@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 dirs = "6"
-iced = { version = "0.14", features = ["tokio", "image", "svg"] }
+iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rodio = "0.23"
 serde = { version = "1", features = ["derive"] }
