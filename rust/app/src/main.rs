@@ -1,10 +1,16 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod icons;
 mod media;
 mod model;
 mod output;
 mod remote;
+#[cfg(windows)]
+mod session;
+#[cfg(not(windows))]
+#[path = "session_stub.rs"]
+mod session;
+mod songfile;
 mod style;
 
 use std::collections::{HashMap, HashSet};
@@ -15,16 +21,22 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::image::Handle;
 use iced::widget::{button, column, container, mouse_area, row, scrollable, slider, stack, text, text_input};
 use iced::{ContentFit, Element, Fill, Font, Point, Rectangle, Subscription, Task, Theme, Vector};
-use model::{format_bytes, format_clock, format_duration, greeting_now, Card, Collection, Home, Kind, Library, Search, Source, Track};
+use model::{format_bytes, format_clock, format_duration, greeting_now, Card, Collection, Home, Kind, Library, Look, Resume, Search, Source, Track};
 use output::Output;
 
 fn main() -> iced::Result {
+    #[cfg(windows)]
+    let _ = unsafe { windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::w!("ValDex")) };
+    let mut window = iced::window::Settings::default();
+    window.size = iced::Size::new(1180.0, 760.0);
+    window.min_size = Some(iced::Size::new(960.0, 640.0));
+    window.icon = iced::window::icon::from_file_data(include_bytes!("../../../valdex-icon.png"), None).ok();
     iced::application(App::new, App::update, App::view)
         .title(App::title)
-        .theme(|_: &App| Theme::Dark)
+        .theme(|app: &App| if app.look == Look::Light { Theme::Light } else { Theme::Dark })
         .subscription(App::subscription)
-        .default_font(Font::with_name("Segoe UI"))
-        .window_size((1180.0, 760.0))
+        .default_font(Font::with_name(if cfg!(windows) { "Segoe UI" } else { "Helvetica Neue" }))
+        .window(window)
         .run()
 }
 
@@ -61,8 +73,14 @@ struct App {
     notice: String,
     audio: Option<Output>,
     covers: HashMap<String, Handle>,
+    pictures: HashMap<String, Vec<u8>>,
     pending: HashSet<String>,
     seek_hold: Instant,
+    session: Option<session::Session>,
+    look: Look,
+    pending_seek: Option<f32>,
+    restore_once: bool,
+    resume_saved: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +92,7 @@ enum Screen {
     Downloads,
     Recents,
     Collection,
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +136,7 @@ enum Message {
     Opened(Result<Collection, String>),
     PlayCollection(Result<Collection, String>),
     PlayTrack(Vec<Track>, usize),
-    Audio(Track, Result<Vec<u8>, String>),
+    Audio(Track, Result<(Vec<u8>, f32), String>),
     Toggle,
     Next,
     Previous,
@@ -137,16 +156,24 @@ enum Message {
     PlayNext(Track),
     Enqueue(Track),
     Download(Track),
-    Stored(Track, Result<usize, String>),
+    Stored(Track, Result<(usize, Option<Vec<u8>>), String>),
+    Media,
     Retry,
     Tick,
     Cover(String, Result<Vec<u8>, String>),
+    Kept,
+    Theme(Look),
+    OpenFolder,
 }
 
 impl App {
     fn new() -> (Self, Task<Message>) {
         let library = remote::load_library();
+        let (covers, pictures) = saved_covers(&library);
         let catalog = library.catalog.unwrap_or(Source::Youtube);
+        let look = library.look;
+        let resume = library.resume.clone();
+        style::apply(look);
         let mut app = Self {
             catalog,
             mood: String::new(),
@@ -179,12 +206,39 @@ impl App {
             download_key: None,
             notice: String::new(),
             audio: None,
-            covers: HashMap::new(),
+            covers,
+            pictures,
             pending: HashSet::new(),
             seek_hold: Instant::now(),
+            session: None,
+            look,
+            pending_seek: None,
+            restore_once: false,
+            resume_saved: Instant::now(),
         };
-        let task = app.load_home();
-        (app, task)
+        let resume_task = match resume {
+            Some(saved) if !saved.queue.is_empty() => {
+                app.index = saved.index.min(saved.queue.len() - 1);
+                app.queue = saved.queue;
+                let at = saved.position;
+                app.pending_seek = if at.is_finite() && at > 1.0 { Some(at) } else { None };
+                app.restore_once = true;
+                app.launch()
+            }
+            _ => Task::none(),
+        };
+        let home = app.load_home();
+        let covers = app.cover_task();
+        let saved = app.library.downloads.clone();
+        let upgrade = Task::perform(
+            async move {
+                for track in &saved {
+                    let _ = remote::upgrade_download(track);
+                }
+            },
+            |_| Message::Kept,
+        );
+        (app, Task::batch([home, covers, upgrade, resume_task]))
     }
 
     fn title(&self) -> String {
@@ -197,11 +251,12 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let keys = iced::event::listen_with(on_key);
         let pointer = iced::event::listen_raw(track_pointer);
+        let media = iced::time::every(std::time::Duration::from_millis(150)).map(|_| Message::Media);
         if self.audio.is_some() {
             let tick = iced::time::every(std::time::Duration::from_millis(400)).map(|_| Message::Tick);
-            Subscription::batch([keys, pointer, tick])
+            Subscription::batch([keys, pointer, media, tick])
         } else {
-            Subscription::batch([keys, pointer])
+            Subscription::batch([keys, pointer, media])
         }
     }
 
@@ -280,7 +335,8 @@ impl App {
                 self.hide_menu();
                 self.notice.clear();
                 self.page_error.clear();
-                if screen == Screen::Home && self.home.is_none() { self.load_home() } else { Task::none() }
+                let task = if screen == Screen::Home && self.home.is_none() { self.load_home() } else { Task::none() };
+                if screen == Screen::Downloads { Task::batch([task, self.cover_task()]) } else { task }
             }
             Message::Tab(tab) => {
                 self.tab = tab;
@@ -291,7 +347,7 @@ impl App {
             Message::Opened(result) => self.finish_collection(result, false),
             Message::PlayCollection(result) => self.finish_collection(result, true),
             Message::PlayTrack(tracks, index) => self.begin(tracks, index),
-            Message::Audio(track, Ok(bytes)) => {
+            Message::Audio(track, Ok((bytes, gain))) => {
                 if self.now.as_ref().is_some_and(|current| !current.same(&track)) {
                     return Task::none();
                 }
@@ -306,15 +362,22 @@ impl App {
                 };
                 let measured = media::length_seconds(&bytes).map(u64::from);
                 self.busy.clear();
-                match Output::start(bytes) {
+                match Output::start(bytes, gain) {
                     Ok(output) => {
                         if let Some(seconds) = measured {
                             self.keep_length(&track, seconds);
                         }
                         output.set_volume(self.audible());
+                        if let Some(at) = self.pending_seek.take() {
+                            output.seek(at);
+                            self.position = at;
+                            self.seek_hold = Instant::now();
+                        }
                         self.audio = Some(output);
+                        self.note_resume();
                         self.playing = true;
                         self.playback_error.clear();
+                        self.publish_session();
                     }
                     Err(error) => {
                         self.audio = None;
@@ -332,7 +395,11 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Toggle => self.toggle(),
+            Message::Toggle => {
+                let task = self.toggle();
+                self.publish_session();
+                task
+            }
             Message::Next => self.next_track(),
             Message::Previous => self.previous(),
             Message::Seek(seconds) => {
@@ -348,6 +415,8 @@ impl App {
                         audio.seek(seconds);
                     }
                 }
+                self.note_resume();
+                self.publish_session();
                 Task::none()
             }
             Message::Volume(volume) => {
@@ -438,9 +507,12 @@ impl App {
                     self.download_key = None;
                 }
                 match result {
-                    Ok(size) => {
+                    Ok((size, picture)) => {
                         self.library.downloads.retain(|item| !item.same(&track));
-                        self.library.downloads.insert(0, track);
+                        self.library.downloads.insert(0, track.clone());
+                        if let Some(picture) = picture {
+                            self.keep_picture(&track, &picture);
+                        }
                         self.notice = format!("Saved · {}", format_bytes(size as u64));
                         if let Err(error) = remote::save_library(&self.library) {
                             self.notice = error;
@@ -449,6 +521,14 @@ impl App {
                     Err(error) => self.notice = error,
                 }
                 Task::none()
+            }
+            Message::Media => {
+                let commands = self.session.as_ref().map(|session| session.poll()).unwrap_or_default();
+                let mut task = Task::none();
+                for command in commands {
+                    task = Task::batch([task, self.media(command)]);
+                }
+                task
             }
             Message::Retry => match self.screen {
                 Screen::Search => self.arm_search(),
@@ -465,18 +545,38 @@ impl App {
                 if self.seek_hold.elapsed() > std::time::Duration::from_millis(350) {
                     self.position = position;
                 }
+                if self.resume_saved.elapsed() > std::time::Duration::from_secs(5) {
+                    self.note_resume();
+                }
                 let duration = self.now.as_ref().and_then(|track| track.duration).unwrap_or(0) as f32;
                 if output::song_ended(finished, position, duration) {
                     self.next_track()
                 } else {
+                    self.publish_session();
                     Task::none()
                 }
             }
             Message::Cover(url, Ok(bytes)) => {
+                self.keep_picture_url(&url, &bytes);
                 self.covers.insert(url, Handle::from_bytes(bytes));
+                self.publish_session();
                 Task::none()
             }
             Message::Cover(_, Err(_)) => Task::none(),
+            Message::Kept => Task::none(),
+            Message::Theme(look) => {
+                self.look = look;
+                self.library.look = look;
+                style::apply(look);
+                let _ = remote::save_library(&self.library);
+                Task::none()
+            }
+            Message::OpenFolder => {
+                if let Err(error) = remote::open_downloads() {
+                    self.notice = error;
+                }
+                Task::none()
+            }
         }
     }
 
@@ -614,7 +714,11 @@ impl App {
 
     fn launch(&mut self) -> Task<Message> {
         let Some(track) = self.queue.get(self.index).cloned() else { return Task::none() };
-        self.remember(&track);
+        let restore = self.restore_once;
+        self.restore_once = false;
+        if !restore {
+            self.pending_seek = None;
+        }
         self.now = Some(track.clone());
         self.audio = None;
         self.playing = false;
@@ -622,11 +726,12 @@ impl App {
         self.seek_target = None;
         self.playback_error.clear();
         self.busy = format!("Starting {}…", track.title);
+        self.remember(&track);
         let requested = track.clone();
         if remote::has_download(&track) {
-            return Task::perform(async move { remote::read_download(&requested).ok_or_else(|| "That download is missing.".to_string()) }, move |result| Message::Audio(track, result));
+            return Task::perform(async move { with_level(remote::read_download(&requested).ok_or_else(|| "That download is missing.".to_string())).await }, move |result| Message::Audio(track, result));
         }
-        Task::perform(async move { remote::audio(&requested).await }, move |result| Message::Audio(track, result))
+        Task::perform(async move { with_level(remote::audio(&requested).await).await }, move |result| Message::Audio(track, result))
     }
 
     fn play_next(&mut self, track: Track) -> Task<Message> {
@@ -645,6 +750,8 @@ impl App {
         }
         if remote::has_download(&track) {
             remote::delete_download(&track);
+            self.covers.remove(&remote::cover_key(&track));
+            self.pictures.remove(&remote::cover_key(&track));
             self.library.downloads.retain(|item| !item.same(&track));
             if let Err(error) = remote::save_library(&self.library) {
                 self.notice = error;
@@ -656,11 +763,13 @@ impl App {
         self.download_key = Some(track_key(&track));
         self.notice = format!("Downloading {}…", track.title);
         let requested = track.clone();
+        let cached = remote::absolute_media(&track.thumbnail).and_then(|url| self.pictures.get(&url).cloned());
         Task::perform(
             async move {
                 let bytes = remote::audio(&requested).await?;
-                remote::save_download(&requested, &bytes)?;
-                Ok(bytes.len())
+                let picture = saved_or_fetched(&requested, cached).await;
+                remote::save_download(&requested, &bytes, picture.as_deref())?;
+                Ok((bytes.len(), picture))
             },
             move |result| Message::Stored(track, result),
         )
@@ -677,6 +786,7 @@ impl App {
         self.playing = true;
         self.busy.clear();
         self.playback_error.clear();
+        self.publish_session();
         true
     }
 
@@ -701,6 +811,7 @@ impl App {
             if let Some(audio) = &self.audio {
                 audio.pause();
             }
+            self.publish_session();
             Task::none()
         }
     }
@@ -711,6 +822,8 @@ impl App {
             if let Some(audio) = &self.audio {
                 audio.seek(0.0);
             }
+            self.note_resume();
+            self.publish_session();
             return Task::none();
         }
         if self.index > 0 {
@@ -734,6 +847,8 @@ impl App {
             self.audio = None;
             self.playing = false;
             self.index = 0;
+            self.note_resume();
+            self.publish_session();
             return Task::none();
         }
         if index < self.index {
@@ -748,14 +863,19 @@ impl App {
     }
 
     fn toggle(&mut self) -> Task<Message> {
+        let mut paused = false;
         if let Some(audio) = &self.audio {
             if self.playing {
                 audio.pause();
                 self.playing = false;
+                paused = true;
             } else {
                 audio.resume();
                 self.playing = true;
             }
+        }
+        if paused {
+            self.note_resume();
         }
         Task::none()
     }
@@ -795,6 +915,22 @@ impl App {
         self.library.recents.retain(|item| !item.same(track));
         self.library.recents.insert(0, track.clone());
         self.library.recents.truncate(30);
+        self.note_resume();
+    }
+
+    fn note_resume(&mut self) {
+        if self.queue.is_empty() {
+            if self.library.resume.take().is_some() {
+                let _ = remote::save_library(&self.library);
+            }
+            return;
+        }
+        self.library.resume = Some(Resume {
+            queue: self.queue.clone(),
+            index: self.index.min(self.queue.len() - 1),
+            position: if self.position.is_finite() { self.position.max(0.0) } else { 0.0 },
+        });
+        self.resume_saved = Instant::now();
         if let Err(error) = remote::save_library(&self.library) {
             self.playback_error = error;
         }
@@ -843,6 +979,12 @@ impl App {
             }
         }
         for track in self.library.likes.iter().chain(&self.library.recents).chain(&self.queue) {
+            push(&track.thumbnail);
+        }
+        for track in &self.library.downloads {
+            if self.covers.contains_key(&remote::cover_key(track)) {
+                continue;
+            }
             push(&track.thumbnail);
         }
         if let Some(track) = &self.now {
@@ -902,9 +1044,9 @@ impl App {
             .padding([8, 16])
             .size(14)
             .style(style::search)
-            .width(520.0);
+            .width(Fill);
         container(
-            row![container(word).width(180), container(search).width(Fill).align_x(Horizontal::Center), container(text("")).width(180)]
+            row![container(word).width(160), container(search).width(Fill).align_x(Horizontal::Center), iced::widget::Space::new().width(160)]
                 .width(Fill)
                 .align_y(Vertical::Center)
                 .padding([8, 16]),
@@ -918,7 +1060,7 @@ impl App {
             let button = button(text(source.label()).size(14)).on_press(Message::Catalog(source)).padding([6, 14]);
             if source == self.catalog { button.style(style::chip_on) } else { button.style(style::chip_off) }.into()
         });
-        container(row(chips).spacing(8).padding(pad(0.0, 16.0, 10.0, 16.0))).into()
+        container(row(chips).spacing(8).padding(pad(0.0, 16.0, 10.0, 16.0)).wrap()).width(Fill).into()
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
@@ -927,14 +1069,22 @@ impl App {
             self.nav(Screen::Home, "Home", self.screen == Screen::Home),
             self.nav(Screen::Search, "Search", self.screen == Screen::Search),
             self.nav(Screen::Library, "Library", library_on),
-            text("ON THIS PC").size(11).color(style::FAINT),
+            text("ON THIS PC").size(11).color(style::faint()),
             self.nav(Screen::Liked, "Liked songs", self.screen == Screen::Liked),
             self.nav(Screen::Downloads, "Downloads", self.screen == Screen::Downloads),
             self.nav(Screen::Recents, "Recently played", self.screen == Screen::Recents),
         ]
-        .spacing(4)
-        .padding(12);
-        container(nav).width(220).height(Fill).into()
+        .spacing(4);
+        let body = column![nav, iced::widget::Space::new().height(Fill), self.settings_nav()].spacing(4).padding(12).height(Fill);
+        container(body).width(220).height(Fill).into()
+    }
+
+    fn settings_nav(&self) -> Element<'_, Message> {
+        let on = self.screen == Screen::Settings;
+        let color = if on { style::fg() } else { style::muted() };
+        let label = row![icons::draw(icons::Glyph::Settings, 16.0, color), text("Settings").size(14)].spacing(8).align_y(Vertical::Center);
+        let button = button(label).on_press(Message::Go(Screen::Settings)).padding([8, 12]).width(Fill);
+        if on { button.style(style::nav_on) } else { button.style(style::nav_off) }.into()
     }
 
     fn nav<'a>(&'a self, screen: Screen, label: &'a str, on: bool) -> Element<'a, Message> {
@@ -950,12 +1100,12 @@ impl App {
     fn page(&self) -> Element<'_, Message> {
         let mut parts: Vec<Element<'_, Message>> = Vec::new();
         if !self.notice.is_empty() {
-            parts.push(text(&self.notice).size(14).color(style::AMBER).into());
+            parts.push(text(&self.notice).size(14).color(style::amber()).into());
         }
         if !self.page_error.is_empty() {
             parts.push(self.error_block());
         } else if !self.page_status.is_empty() && !self.has_page() {
-            parts.push(text(&self.page_status).size(16).color(style::MUTED).into());
+            parts.push(text(&self.page_status).size(16).color(style::muted()).into());
         }
         parts.push(match self.screen {
             Screen::Home => self.home_page(),
@@ -965,8 +1115,9 @@ impl App {
             Screen::Downloads => self.downloads_page(),
             Screen::Recents => self.track_page("Recently played", "The last songs started on this PC.", &self.library.recents),
             Screen::Collection => self.collection_page(),
+            Screen::Settings => self.settings_page(),
         });
-        column(parts).spacing(16).into()
+        column(parts).spacing(16).width(Fill).into()
     }
 
     fn has_page(&self) -> bool {
@@ -978,6 +1129,30 @@ impl App {
         }
     }
 
+    fn settings_page(&self) -> Element<'_, Message> {
+        let choices = row(Look::ALL.map(|look| self.theme_choice(look))).spacing(8).wrap();
+        let folder = remote::downloads_folder().display().to_string();
+        column![
+            text("Settings").size(32).font(style::strong()),
+            text("Theme").size(16).font(style::strong()),
+            choices,
+            text("Downloads").size(16).font(style::strong()),
+            text(folder).size(13).color(style::muted()).width(Fill),
+            button(text("Open folder").size(14)).on_press(Message::OpenFolder).padding([8, 14]).style(style::chip_on),
+        ]
+        .spacing(12)
+        .width(Fill)
+        .into()
+    }
+
+    fn theme_choice(&self, look: Look) -> Element<'_, Message> {
+        let on = self.look == look;
+        let swatch = container(text("")).width(14).height(14).style(style::dot(style::swatch(look)));
+        let label = row![swatch, text(look.label()).size(14)].spacing(8).align_y(Vertical::Center);
+        let button = button(label).on_press(Message::Theme(look)).padding([8, 14]);
+        if on { button.style(style::chip_on) } else { button.style(style::chip_off) }.into()
+    }
+
     fn error_block(&self) -> Element<'_, Message> {
         let title = match self.screen {
             Screen::Search => "Search didn't finish",
@@ -986,7 +1161,7 @@ impl App {
         };
         column![
             text(title).size(28).font(style::strong()),
-            text(&self.page_error).size(14).color(style::MUTED),
+            text(&self.page_error).size(14).color(style::muted()),
             button(text("Try again").size(14)).on_press(Message::Retry).padding([8, 14]).style(style::chip_on),
         ]
         .spacing(8)
@@ -995,9 +1170,9 @@ impl App {
 
     fn home_page(&self) -> Element<'_, Message> {
         let mut parts: Vec<Element<'_, Message>> = vec![
-            text("Windows 11 edition").size(13).color(style::MUTED).into(),
+            text("Windows 11 edition").size(13).color(style::muted()).into(),
             text(greeting_now()).size(36).font(style::strong()).into(),
-            text(self.catalog.blurb()).size(14).color(style::MUTED).into(),
+            text(self.catalog.blurb()).size(14).color(style::muted()).into(),
         ];
         if let Some(home) = &self.home {
             if !home.filters.is_empty() {
@@ -1009,16 +1184,16 @@ impl App {
                         if filter == &self.mood { button.style(style::chip_pink) } else { button.style(style::chip_off) }.into()
                     })
                     .collect();
-                parts.push(row(filters).spacing(8).into());
+                parts.push(row(filters).spacing(8).wrap().into());
             }
             if home.shelves.is_empty() {
-                parts.push(text("Nothing on this shelf. Try another filter, or search for something specific.").size(14).color(style::MUTED).into());
+                parts.push(text("Nothing on this shelf. Try another filter, or search for something specific.").size(14).color(style::muted()).into());
             }
             for shelf in &home.shelves {
                 parts.push(self.shelf(shelf.title.as_str(), &shelf.items));
             }
         }
-        column(parts).spacing(14).into()
+        column(parts).spacing(14).width(Fill).into()
     }
 
     fn search_page(&self) -> Element<'_, Message> {
@@ -1026,25 +1201,25 @@ impl App {
         if query.len() < 2 {
             let mut parts: Vec<Element<'_, Message>> = vec![
                 text("Search").size(32).font(style::strong()).into(),
-                text(format!("Look up a song, an album, an artist, or a playlist on {}.", self.catalog.label())).size(14).color(style::MUTED).into(),
+                text(format!("Look up a song, an album, an artist, or a playlist on {}.", self.catalog.label())).size(14).color(style::muted()).into(),
             ];
             if !self.library.searches.is_empty() {
                 let chips: Vec<Element<'_, Message>> = self
                     .library
                     .searches
                     .iter()
-                    .map(|item| button(text(item).size(14)).on_press(Message::Query(item.clone())).padding([6, 14]).style(style::chip_off).into())
+                    .map(|item| button(chip_label(item)).on_press(Message::Query(item.clone())).padding([6, 14]).style(style::chip_off).into())
                     .collect();
-                parts.push(row(chips).spacing(8).into());
+                parts.push(row(chips).spacing(8).wrap().into());
             }
-            return column(parts).spacing(12).into();
+            return column(parts).spacing(12).width(Fill).into();
         }
         let Some(results) = &self.results else {
             return column![].spacing(0).into();
         };
         let mut parts: Vec<Element<'_, Message>> = vec![
             text(format!("Results for “{query}”")).size(32).font(style::strong()).into(),
-            text(self.catalog.label()).size(13).color(style::MUTED).into(),
+            text(self.catalog.label()).size(13).color(style::muted()).into(),
             self.search_tabs(),
         ];
         let songs = results.tracks();
@@ -1054,7 +1229,7 @@ impl App {
         let show_playlists = matches!(self.tab, SearchTab::All | SearchTab::Playlists);
         if show_songs {
             if songs.is_empty() && self.tab == SearchTab::Songs {
-                parts.push(text("This search didn't include songs.").size(14).color(style::MUTED).into());
+                parts.push(text("This search didn't include songs.").size(14).color(style::muted()).into());
             } else if !songs.is_empty() {
                 parts.push(self.tracks(&songs));
             }
@@ -1070,9 +1245,9 @@ impl App {
         }
         let empty = songs.is_empty() && results.albums.is_empty() && results.artists.is_empty() && results.playlists.is_empty();
         if empty {
-            parts.push(text(format!("Nothing came back for “{query}”. Try the artist and the title together.")).size(14).color(style::MUTED).into());
+            parts.push(text(format!("Nothing came back for “{query}”. Try the artist and the title together.")).size(14).color(style::muted()).into());
         }
-        column(parts).spacing(16).into()
+        column(parts).spacing(16).width(Fill).into()
     }
 
     fn search_tabs(&self) -> Element<'_, Message> {
@@ -1088,12 +1263,12 @@ impl App {
             let button = button(text(label).size(13)).on_press(Message::Tab(tab)).padding([5, 12]);
             if tab == self.tab { button.style(style::chip_on) } else { button.style(style::chip_off) }.into()
         });
-        row(chips).spacing(8).into()
+        row(chips).spacing(8).wrap().into()
     }
 
     fn optional_shelf<'a>(&'a self, title: &'a str, cards: &'a [Card], required: bool) -> Element<'a, Message> {
         if cards.is_empty() {
-            if required { text(format!("This search didn't include {title}.")).size(14).color(style::MUTED).into() } else { column![].into() }
+            if required { text(format!("This search didn't include {title}.")).size(14).color(style::muted()).into() } else { column![].into() }
         } else {
             self.shelf(title, cards)
         }
@@ -1102,12 +1277,13 @@ impl App {
     fn library_page(&self) -> Element<'_, Message> {
         column![
             text("Library").size(32).font(style::strong()),
-            text("Saved on this PC.").size(14).color(style::MUTED),
+            text("Saved on this PC.").size(14).color(style::muted()),
             self.library_row("Liked songs", format!("{} saved", self.library.likes.len()), Screen::Liked),
             self.library_row("Downloads", self.download_summary(), Screen::Downloads),
             self.library_row("Recently played", format!("{} songs", self.library.recents.len()), Screen::Recents),
         ]
         .spacing(12)
+        .width(Fill)
         .into()
     }
 
@@ -1132,8 +1308,8 @@ impl App {
 
     fn library_row<'a>(&'a self, title: &'a str, detail: String, screen: Screen) -> Element<'a, Message> {
         let body = row![
-            column![text(title).size(16).font(style::strong()), text(detail).size(13).color(style::MUTED)].width(Fill).spacing(2),
-            text("Open").size(13).color(style::MUTED),
+            column![text(title).size(16).font(style::strong()), text(detail).size(13).color(style::muted())].width(Fill).spacing(2),
+            text("Open").size(13).color(style::muted()),
         ]
         .align_y(Vertical::Center)
         .padding([12, 14]);
@@ -1145,20 +1321,21 @@ impl App {
             return column![].into();
         };
         let tracks = collection.playable();
-        let mut info = column![text(&collection.title).size(32).font(style::strong()), text(&collection.subtitle).size(14).color(style::MUTED)].spacing(8);
+        let mut info = column![text(&collection.title).size(32).font(style::strong()), text(&collection.subtitle).size(14).color(style::muted())].spacing(8);
         if !tracks.is_empty() {
-            info = info.push(button(icons::draw(icons::Glyph::Play, 16.0, style::BLACK)).on_press(Message::PlayTrack(tracks.clone(), 0)).padding(10).style(style::play));
+            info = info.push(button(icons::draw(icons::Glyph::Play, 16.0, style::play_icon())).on_press(Message::PlayTrack(tracks.clone(), 0)).padding(10).style(style::play));
         }
         column![
             row![self.cover(&collection.thumbnail, &collection.title, 112.0, 18.0), info].spacing(16).align_y(Vertical::Center),
             self.tracks(&tracks),
         ]
         .spacing(18)
+        .width(Fill)
         .into()
     }
 
     fn track_page<'a>(&'a self, title: &'a str, body: &'a str, tracks: &[Track]) -> Element<'a, Message> {
-        column![text(title).size(32).font(style::strong()), text(body).size(14).color(style::MUTED), self.tracks(tracks)].spacing(12).into()
+        column![text(title).size(32).font(style::strong()), text(body).size(14).color(style::muted()).width(Fill), self.tracks(tracks)].spacing(12).width(Fill).into()
     }
 
     fn shelf<'a>(&'a self, title: &'a str, cards: &'a [Card]) -> Element<'a, Message> {
@@ -1177,8 +1354,8 @@ impl App {
         column![
             mouse_area(self.cover(card.art(), &card.title, 160.0, 16.0)).on_press(open.clone()),
             row![
-                column![text(&card.title).size(14).font(style::strong()), text(subtitle).size(12).color(style::MUTED)].width(Fill).spacing(2),
-                button(icons::draw(icons::Glyph::Play, 14.0, style::BLACK)).on_press(play).padding(8).style(style::play),
+                column![text(&card.title).size(14).font(style::strong()), text(subtitle).size(12).color(style::muted())].width(Fill).spacing(2),
+                button(icons::draw(icons::Glyph::Play, 14.0, style::play_icon())).on_press(play).padding(8).style(style::play),
             ]
             .spacing(6)
             .align_y(Vertical::Center),
@@ -1190,39 +1367,39 @@ impl App {
 
     fn tracks(&self, tracks: &[Track]) -> Element<'_, Message> {
         if tracks.is_empty() {
-            return text("Nothing in this list yet.").size(14).color(style::MUTED).into();
+            return text("Nothing in this list yet.").size(14).color(style::muted()).into();
         }
-        column(tracks.iter().enumerate().map(|(index, track)| self.track_row(track, index, tracks)).collect::<Vec<_>>()).spacing(2).into()
+        column(tracks.iter().enumerate().map(|(index, track)| self.track_row(track, index, tracks)).collect::<Vec<_>>()).spacing(2).width(Fill).into()
     }
 
     fn track_row(&self, track: &Track, index: usize, list: &[Track]) -> Element<'_, Message> {
         let active = self.now.as_ref().is_some_and(|current| current.same(track));
-        let title = text(track.title.clone()).size(14).font(style::strong()).color(if active { style::PINK } else { style::FG });
+        let title = text(track.title.clone()).size(14).font(style::strong()).width(Fill).color(if active { style::highlight() } else { style::fg() });
         let mut detail = track.artist();
         if let Some(album) = track.album.as_ref().filter(|album| !album.name.is_empty()) {
             detail.push_str(" · ");
             detail.push_str(&album.name);
         }
         let main = row![
-            text(format!("{}", index + 1)).size(13).color(if active { style::PINK } else { style::FAINT }).width(28),
-            self.cover(&track.thumbnail, &track.title, 44.0, 8.0),
-            column![title, text(detail).size(12).color(style::MUTED)].width(Fill).spacing(2),
+            text(format!("{}", index + 1)).size(13).color(if active { style::highlight() } else { style::faint() }).width(28),
+            self.track_cover(track, 44.0, 8.0),
+            column![title, text(detail).size(12).color(style::muted()).width(Fill)].width(Fill).spacing(2),
         ]
         .spacing(10)
         .align_y(Vertical::Center)
         .width(Fill);
         let liked = self.liked(track);
         let open = self.menu.as_ref().is_some_and(|item| item.same(track));
-        let heart = button(icons::draw(if liked { icons::Glyph::HeartOn } else { icons::Glyph::Heart }, 18.0, if liked { style::PINK } else { style::FAINT }))
+        let heart = button(icons::draw(if liked { icons::Glyph::HeartOn } else { icons::Glyph::Heart }, 18.0, if liked { style::highlight() } else { style::faint() }))
             .on_press(Message::Like(track.clone()))
             .padding(6)
             .style(if liked { style::heart_on } else { style::heart_off });
-        let more = button(icons::draw(icons::Glyph::More, 18.0, if open { style::PINK } else { style::FG }))
+        let more = button(icons::draw(icons::Glyph::More, 18.0, if open { style::highlight() } else { style::fg() }))
             .on_press(Message::Menu(track.clone()))
             .padding(6)
             .style(if open { style::chip_on } else { style::ghost });
-        let tail = row![text(format_duration(track.duration)).size(12).color(style::FAINT), heart, more].spacing(4).align_y(Vertical::Center);
-        let row = row![container(mouse_area(main).on_press(Message::PlayTrack(list.to_vec(), index))).width(Fill), tail].spacing(8).align_y(Vertical::Center);
+        let tail = row![text(format_duration(track.duration)).size(12).color(style::faint()), heart, more].spacing(4).align_y(Vertical::Center);
+        let row = row![container(mouse_area(main).on_press(Message::PlayTrack(list.to_vec(), index))).width(Fill), tail].spacing(8).align_y(Vertical::Center).width(Fill);
         container(row).padding([4, 6]).width(Fill).style(if active { style::row_on } else { style::row_off }).into()
     }
 
@@ -1246,21 +1423,101 @@ impl App {
             download_button,
         ]
         .spacing(2);
-        container(items).width(220).padding(6).style(style::fill(iced::Color::from_rgb8(0x2c, 0x1c, 0x28), 12.0)).into()
+        container(items).width(220).padding(6).style(style::fill(style::surface(), 12.0)).into()
     }
 
     fn menu_item(&self, label: &str, message: Message) -> Element<'_, Message> {
         button(text(label.to_string()).size(13)).on_press(message).padding([8, 10]).width(Fill).style(style::ghost).into()
     }
 
+    fn track_cover(&self, track: &Track, size: f32, radius: f32) -> Element<'_, Message> {
+        let key = remote::cover_key(track);
+        if let Some(handle) = self.covers.get(&key) {
+            return iced::widget::image(handle.clone()).width(size).height(size).content_fit(ContentFit::Cover).border_radius(radius).into();
+        }
+        self.cover(&track.thumbnail, &track.title, size, radius)
+    }
+
+    fn keep_picture(&mut self, track: &Track, bytes: &[u8]) {
+        let key = remote::cover_key(track);
+        self.pictures.insert(key.clone(), bytes.to_vec());
+        self.covers.insert(key, Handle::from_bytes(bytes.to_vec()));
+        if let Some(url) = remote::absolute_media(&track.thumbnail) {
+            self.pictures.insert(url.clone(), bytes.to_vec());
+            self.covers.insert(url, Handle::from_bytes(bytes.to_vec()));
+        }
+    }
+
+    fn keep_picture_url(&mut self, url: &str, bytes: &[u8]) {
+        self.pictures.insert(url.to_string(), bytes.to_vec());
+        let saved: Vec<Track> = self.library.downloads.iter().filter(|track| remote::absolute_media(&track.thumbnail).as_deref() == Some(url)).cloned().collect();
+        for track in saved {
+            let _ = remote::save_cover(&track, bytes);
+            self.keep_picture(&track, bytes);
+        }
+    }
+
+    fn art_bytes(&self, track: &Track) -> Option<Vec<u8>> {
+        self.pictures.get(&remote::cover_key(track)).cloned().or_else(|| remote::absolute_media(&track.thumbnail).and_then(|url| self.pictures.get(&url).cloned()))
+    }
+
+    fn publish_session(&mut self) {
+        let Some(track) = self.now.clone() else {
+            if let Some(session) = self.session.as_mut() {
+                session.clear();
+            }
+            return;
+        };
+        if self.session.is_none() {
+            self.session = session::Session::open().ok();
+        }
+        let key = remote::cover_key(&track);
+        let need_art = match self.session.as_ref() {
+            Some(session) => session.needs_art(&key),
+            None => true,
+        };
+        let art = if need_art { self.art_bytes(&track) } else { None };
+        let playing = self.playing;
+        let position = self.position;
+        if let Some(session) = self.session.as_mut() {
+            session.show(&track, playing, position, art.as_deref());
+        }
+    }
+
+    fn media(&mut self, command: session::Command) -> Task<Message> {
+        match command {
+            session::Command::Play => {
+                if !self.playing {
+                    let _ = self.toggle();
+                }
+            }
+            session::Command::Pause | session::Command::Stop => {
+                if self.playing {
+                    let _ = self.toggle();
+                }
+            }
+            session::Command::Next => return self.next_track(),
+            session::Command::Previous => return self.previous(),
+            session::Command::Seek(seconds) => {
+                self.position = seconds;
+                self.seek_hold = Instant::now();
+                if let Some(audio) = &self.audio {
+                    audio.seek(seconds);
+                }
+            }
+        }
+        self.publish_session();
+        Task::none()
+    }
+
     fn cover(&self, raw: &str, title: &str, size: f32, radius: f32) -> Element<'_, Message> {
         let letter = title.chars().next().unwrap_or('♪').to_string();
-        let placeholder = container(text(letter).size(size * 0.34).font(style::strong()).color(style::INK))
+        let placeholder = container(text(letter).size(size * 0.34).font(style::strong()).color(style::on_accent()))
             .width(size)
             .height(size)
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center)
-            .style(style::fill(if title.len() % 2 == 0 { style::PINK } else { style::PURPLE }, radius));
+            .style(style::fill(if title.len() % 2 == 0 { style::highlight() } else { style::purple() }, radius));
         let Some(url) = remote::absolute_media(raw) else { return placeholder.into() };
         let Some(handle) = self.covers.get(&url) else { return placeholder.into() };
         iced::widget::image(handle.clone()).width(size).height(size).content_fit(ContentFit::Cover).border_radius(radius).into()
@@ -1270,20 +1527,20 @@ impl App {
         let duration = self.now.as_ref().and_then(|track| track.duration).unwrap_or(0) as f32;
         let max = duration.max(self.position).max(1.0);
         let seek = slider(0.0..=max, self.position.clamp(0.0, max), Message::Seek).step(0.1_f32).on_release(Message::SeekRelease).width(Fill).height(18).style(style::seek);
-        let cover = self.now.as_ref().map(|track| self.cover(&track.thumbnail, &track.title, 48.0, 8.0)).unwrap_or_else(|| self.cover("", "", 48.0, 8.0));
+        let cover = self.now.as_ref().map(|track| self.track_cover(track, 48.0, 8.0)).unwrap_or_else(|| self.cover("", "", 48.0, 8.0));
         let title = self.now.as_ref().map(|track| track.title.clone()).unwrap_or_else(|| "Nothing playing".into());
         let artist = if !self.playback_error.is_empty() {
-            text(&self.playback_error).size(12).color(style::AMBER)
+            text(&self.playback_error).size(12).color(style::amber()).width(Fill)
         } else if !self.busy.is_empty() {
-            text(&self.busy).size(12).color(style::MUTED)
+            text(&self.busy).size(12).color(style::muted()).width(Fill)
         } else {
-            text(self.now.as_ref().map(|track| track.artist()).unwrap_or_else(|| "Pick a song from Home or Search".into())).size(12).color(style::MUTED)
+            text(self.now.as_ref().map(|track| track.artist()).unwrap_or_else(|| "Pick a song from Home or Search".into())).size(12).color(style::muted()).width(Fill)
         };
-        let identity = row![cover, column![text(title).size(14).font(style::strong()), artist].width(Fill).spacing(2)].spacing(10).align_y(Vertical::Center).width(Fill);
+        let identity = row![cover, column![text(title).size(14).font(style::strong()).width(Fill), artist].width(Fill).spacing(2)].spacing(10).align_y(Vertical::Center).width(Fill);
         let controls = row![
             self.control(icons::Glyph::Shuffle, Message::Shuffle, self.shuffle),
             self.control(icons::Glyph::Previous, Message::Previous, false),
-            button(icons::draw(if self.playing { icons::Glyph::Pause } else { icons::Glyph::Play }, 18.0, style::BLACK)).on_press(Message::Toggle).padding(12).style(style::play),
+            button(icons::draw(if self.playing { icons::Glyph::Pause } else { icons::Glyph::Play }, 18.0, style::play_icon())).on_press(Message::Toggle).padding(12).style(style::play),
             self.control(icons::Glyph::Next, Message::Next, false),
             self.control(if self.repeat == Repeat::One { icons::Glyph::RepeatOne } else { icons::Glyph::Repeat }, Message::CycleRepeat, self.repeat != Repeat::Off),
         ]
@@ -1291,7 +1548,7 @@ impl App {
         .align_y(Vertical::Center);
         let liked = self.now.as_ref().is_some_and(|track| self.liked(track));
         let heart: Option<Element<'_, Message>> = self.now.as_ref().map(|track| {
-            button(icons::draw(if liked { icons::Glyph::HeartOn } else { icons::Glyph::Heart }, 18.0, if liked { style::PINK } else { style::FAINT }))
+            button(icons::draw(if liked { icons::Glyph::HeartOn } else { icons::Glyph::Heart }, 18.0, if liked { style::highlight() } else { style::faint() }))
                 .on_press(Message::Like(track.clone()))
                 .padding(6)
                 .style(if liked { style::heart_on } else { style::heart_off })
@@ -1306,7 +1563,7 @@ impl App {
             icons::Glyph::Volume
         };
         let mut extras = row![
-            text(format!("{} / {}", format_clock(self.position), format_clock(duration))).size(12).color(style::FAINT),
+            text(format!("{} / {}", format_clock(self.position), format_clock(duration))).size(12).color(style::faint()),
             self.control(volume_icon, Message::Mute, false),
             volume,
             self.control(icons::Glyph::Queue, Message::Queue(!self.queue_open), self.queue_open),
@@ -1316,32 +1573,32 @@ impl App {
         if let Some(heart) = heart {
             extras = extras.push(heart);
         }
-        let bar = row![identity, controls, row![iced::widget::Space::new().width(Fill), extras].width(Fill).align_y(Vertical::Center)].spacing(12).align_y(Vertical::Center).padding(pad(8.0, 16.0, 12.0, 16.0));
-        container(column![seek, bar].spacing(6).width(Fill)).width(Fill).style(style::fill(style::BAR, 0.0)).into()
+        let bar = row![identity, controls, extras].spacing(12).align_y(Vertical::Center).padding(pad(8.0, 16.0, 12.0, 16.0)).width(Fill);
+        container(column![seek, bar].spacing(6).width(Fill)).width(Fill).style(style::fill(style::bar(), 0.0)).into()
     }
 
     fn control(&self, glyph: icons::Glyph, message: Message, accent: bool) -> Element<'_, Message> {
-        let color = if accent { style::PINK } else { style::FG };
+        let color = if accent { style::highlight() } else { style::fg() };
         button(icons::draw(glyph, 18.0, color)).on_press(message).padding(8).style(if accent { style::accent } else { style::ghost }).into()
     }
 
     fn queue_panel(&self) -> Element<'_, Message> {
         let mut rows: Vec<Element<'_, Message>> = Vec::new();
         if self.queue.is_empty() {
-            rows.push(text("The queue is empty.").size(14).color(style::MUTED).into());
+            rows.push(text("The queue is empty.").size(14).color(style::muted()).into());
         }
         for (index, track) in self.queue.iter().enumerate() {
             let current = index == self.index && self.now.as_ref().is_some_and(|playing| playing.same(track));
             let line = row![
-                container(mouse_area(column![text(&track.title).size(13).color(if current { style::PINK } else { style::FG }), text(track.artist()).size(12).color(style::MUTED)].width(Fill).spacing(1)).on_press(Message::Jump(index))).width(Fill),
-                button(icons::draw(icons::Glyph::Close, 14.0, style::FG)).on_press(Message::Remove(index)).padding(4).style(style::ghost),
+                container(mouse_area(column![text(&track.title).size(13).color(if current { style::highlight() } else { style::fg() }), text(track.artist()).size(12).color(style::muted())].width(Fill).spacing(1)).on_press(Message::Jump(index))).width(Fill),
+                button(icons::draw(icons::Glyph::Close, 14.0, style::fg())).on_press(Message::Remove(index)).padding(4).style(style::ghost),
             ]
             .spacing(6)
             .align_y(Vertical::Center);
             rows.push(container(line).padding([6, 4]).style(if current { style::row_on } else { style::row_off }).into());
         }
         let header = row![
-            column![text("Queue").size(16).font(style::strong()), text(format!("{} songs", self.queue.len())).size(12).color(style::MUTED)].spacing(2).width(Fill),
+            column![text("Queue").size(16).font(style::strong()), text(format!("{} songs", self.queue.len())).size(12).color(style::muted())].spacing(2).width(Fill),
             button(text("Clear").size(12)).on_press(Message::ClearUpcoming).padding([4, 8]).style(style::ghost),
             button(text("Close").size(12)).on_press(Message::Queue(false)).padding([4, 8]).style(style::ghost),
         ]
@@ -1350,7 +1607,7 @@ impl App {
         container(column![header, scrollable(column(rows).spacing(2).padding(pad(0.0, 8.0, 12.0, 8.0))).height(Fill)].spacing(4))
             .width(320)
             .height(Fill)
-            .style(style::fill(style::BAR, 0.0))
+            .style(style::fill(style::bar(), 0.0))
             .into()
     }
 }
@@ -1359,13 +1616,23 @@ fn pad(top: f32, right: f32, bottom: f32, left: f32) -> iced::Padding {
     iced::Padding { top, right, bottom, left }
 }
 
+fn chip_label(label: &str) -> Element<'static, Message> {
+    let long = label.chars().count() > 28;
+    let label = text(label.to_string()).size(14);
+    if long {
+        label.width(220).wrapping(iced::widget::text::Wrapping::WordOrGlyph).into()
+    } else {
+        label.into()
+    }
+}
+
 fn mark() -> Element<'static, Message> {
-    container(text("V").size(16).font(style::strong()).color(style::INK))
+    container(text("V").size(16).font(style::strong()).color(style::on_accent()))
         .width(28)
         .height(28)
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center)
-        .style(style::fill(style::PINK, 8.0))
+        .style(style::fill(style::highlight(), 8.0))
         .into()
 }
 
@@ -1375,6 +1642,47 @@ fn hairline() -> Element<'static, Message> {
 
 fn hairline_vertical() -> Element<'static, Message> {
     container(iced::widget::Space::new().width(1).height(Fill)).width(1).height(Fill).style(style::line).into()
+}
+
+fn saved_covers(library: &Library) -> (HashMap<String, Handle>, HashMap<String, Vec<u8>>) {
+    let mut covers = HashMap::new();
+    let mut pictures = HashMap::new();
+    for track in &library.downloads {
+        let Some(bytes) = remote::read_cover(track) else { continue };
+        let handle = Handle::from_bytes(bytes.clone());
+        covers.insert(remote::cover_key(track), handle.clone());
+        pictures.insert(remote::cover_key(track), bytes.clone());
+        if let Some(url) = remote::absolute_media(&track.thumbnail) {
+            covers.insert(url.clone(), handle);
+            pictures.insert(url, bytes);
+        }
+    }
+    (covers, pictures)
+}
+
+async fn saved_or_fetched(track: &Track, cached: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    if let Some(bytes) = remote::read_cover(track) {
+        return Some(bytes);
+    }
+    let bytes = if let Some(bytes) = cached {
+        bytes
+    } else {
+        let url = remote::absolute_media(&track.thumbnail)?;
+        remote::image(&url).await.ok()?
+    };
+    let _ = remote::save_cover(track, &bytes);
+    Some(bytes)
+}
+
+async fn with_level(result: Result<Vec<u8>, String>) -> Result<(Vec<u8>, f32), String> {
+    let bytes = std::sync::Arc::new(result?);
+    let measured = std::sync::Arc::clone(&bytes);
+    let gain = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.spawn_blocking(move || output::level(&measured)).await.unwrap_or(1.0),
+        Err(_) => output::level(&bytes),
+    };
+    let bytes = std::sync::Arc::try_unwrap(bytes).unwrap_or_else(|shared| (*shared).clone());
+    Ok((bytes, gain))
 }
 
 fn track_key(track: &Track) -> String {

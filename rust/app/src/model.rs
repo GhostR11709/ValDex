@@ -240,6 +240,36 @@ pub struct Playback {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Look {
+    #[default]
+    Night,
+    Light,
+    Purple,
+}
+
+impl Look {
+    pub const ALL: [Look; 3] = [Look::Night, Look::Light, Look::Purple];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Look::Night => "Night",
+            Look::Light => "Light",
+            Look::Purple => "Purple",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Resume {
+    pub queue: Vec<Track>,
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub position: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Library {
     #[serde(default)]
@@ -252,6 +282,10 @@ pub struct Library {
     pub downloads: Vec<Track>,
     #[serde(default)]
     pub catalog: Option<Source>,
+    #[serde(default)]
+    pub look: Look,
+    #[serde(default)]
+    pub resume: Option<Resume>,
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -332,6 +366,13 @@ fn local_hour() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_library_stays_on_night_with_nothing_to_resume() {
+        let library: Library = serde_json::from_str(r#"{"likes":[]}"#).expect("library");
+        assert_eq!(library.look, Look::Night);
+        assert!(library.resume.is_none());
+    }
 
     #[test]
     fn home_keeps_song_cards_in_order() {

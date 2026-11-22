@@ -1,0 +1,53 @@
+name: Build macOS DMG
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust builds
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust/app
+            rust/launch
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: Build the catalog server
+        run: npm run build
+
+      - name: Build the player
+        run: cargo build --release --manifest-path rust/app/Cargo.toml --target aarch64-apple-darwin
+
+      - name: Build the launcher
+        run: cargo build --release --manifest-path rust/launch/Cargo.toml --target aarch64-apple-darwin
+
+      - name: Pack the disk image
+        run: sh packaging/macos-dmg.sh
+
+      - name: Upload the disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: ValDex-arm64
+          path: dist/ValDex-arm64.dmg
+          if-no-files-found: error

@@ -189,35 +189,137 @@ pub fn download_name(track: &Track) -> String {
     format!("{}-{id}", track.source().as_str())
 }
 
-pub fn download_path(track: &Track) -> std::path::PathBuf {
-    library_path().parent().unwrap_or(std::path::Path::new(".")).join("downloads").join(download_name(track))
+fn downloads_dir() -> std::path::PathBuf {
+    library_path().parent().unwrap_or(std::path::Path::new(".")).join("downloads")
+}
+
+pub fn downloads_folder() -> std::path::PathBuf {
+    downloads_dir()
+}
+
+pub fn open_downloads() -> Result<(), String> {
+    let dir = downloads_dir();
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let opener = if cfg!(windows) { "explorer" } else { "open" };
+    std::process::Command::new(opener).arg(&dir).spawn().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn download_candidates(track: &Track) -> Vec<std::path::PathBuf> {
+    let base = downloads_dir().join(download_name(track));
+    let mut paths = Vec::new();
+    for extension in ["m4a", "mp3", "flac", "ogg", "opus", "wav", "aac", "audio"] {
+        paths.push(base.with_extension(extension));
+    }
+    paths.push(base);
+    paths
+}
+
+fn locate_download(track: &Track) -> Option<std::path::PathBuf> {
+    download_candidates(track).into_iter().find(|path| std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0))
 }
 
 pub fn has_download(track: &Track) -> bool {
-    std::fs::metadata(download_path(track)).is_ok_and(|meta| meta.len() > 0)
+    locate_download(track).is_some()
 }
 
 pub fn download_len(track: &Track) -> u64 {
-    std::fs::metadata(download_path(track)).map(|meta| meta.len()).unwrap_or(0)
+    locate_download(track).and_then(|path| std::fs::metadata(path).ok()).map(|meta| meta.len()).unwrap_or(0)
 }
 
 pub fn read_download(track: &Track) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(download_path(track)).ok()?;
+    let bytes = std::fs::read(locate_download(track)?).ok()?;
     if bytes.is_empty() { None } else { Some(bytes) }
 }
 
-pub fn save_download(track: &Track, bytes: &[u8]) -> Result<(), String> {
-    let path = download_path(track);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+pub fn save_download(track: &Track, bytes: &[u8], cover: Option<&[u8]>) -> Result<(), String> {
+    let stored = crate::songfile::store(bytes, track, cover);
+    let path = write_download(track, &stored.extension, &stored.bytes)?;
+    if !file_opens(&path) && file_bytes_open(bytes) {
+        let plain = crate::songfile::plain(bytes);
+        let fallback = write_download(track, &plain.extension, &plain.bytes)?;
+        if fallback != path {
+            let _ = std::fs::remove_file(path);
+        }
+        remove_other_downloads(track, &fallback);
+        return Ok(());
     }
-    let temp = path.with_extension("part");
+    remove_other_downloads(track, &path);
+    Ok(())
+}
+
+/// Older downloads were saved without an extension or tags. Rewrite those once, and leave the old file if the new one will not play.
+pub fn upgrade_download(track: &Track) -> Result<(), String> {
+    let Some(path) = locate_download(track) else { return Ok(()) };
+    if path.extension().is_some() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let cover = read_cover(track);
+    save_download(track, &bytes, cover.as_deref())
+}
+
+fn write_download(track: &Track, extension: &str, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+    let dir = downloads_dir();
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let name = download_name(track);
+    let path = dir.join(format!("{name}.{extension}"));
+    let temp = dir.join(format!("{name}.{extension}.part"));
     std::fs::write(&temp, bytes).map_err(|error| error.to_string())?;
-    std::fs::rename(&temp, &path).map_err(|error| error.to_string())
+    std::fs::rename(&temp, &path).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn remove_other_downloads(track: &Track, keep: &std::path::Path) {
+    for path in download_candidates(track) {
+        if path != keep {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn file_opens(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    rodio::Decoder::try_from(file).is_ok_and(|decoder| decoder.take(32).count() >= 8)
+}
+
+fn file_bytes_open(bytes: &[u8]) -> bool {
+    rodio::Decoder::try_from(std::io::Cursor::new(bytes.to_vec())).is_ok_and(|decoder| decoder.take(32).count() >= 8)
 }
 
 pub fn delete_download(track: &Track) {
-    let _ = std::fs::remove_file(download_path(track));
+    for path in download_candidates(track) {
+        let _ = std::fs::remove_file(path);
+    }
+    delete_cover(track);
+}
+
+pub fn cover_key(track: &Track) -> String {
+    format!("cover:{}", download_name(track))
+}
+
+pub fn cover_path(track: &Track) -> std::path::PathBuf {
+    library_path().parent().unwrap_or(std::path::Path::new(".")).join("covers").join(format!("{}.img", download_name(track)))
+}
+
+pub fn read_cover(track: &Track) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(cover_path(track)).ok()?;
+    if bytes.len() < 32 { None } else { Some(bytes) }
+}
+
+pub fn save_cover(track: &Track, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 32 {
+        return Err("Artwork wasn't a picture.".into());
+    }
+    let path = cover_path(track);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(path, bytes).map_err(|error| error.to_string())
+}
+
+pub fn delete_cover(track: &Track) {
+    let _ = std::fs::remove_file(cover_path(track));
 }
 
 pub fn save_library(library: &Library) -> Result<(), String> {

@@ -1,13 +1,19 @@
+#[cfg(windows)]
 use std::io::Write;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
+#[cfg(windows)]
 use std::time::Duration;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 use serde::Deserialize;
 
 const REPO: &str = "GhostR11709/ValDex";
 const ASSET: &str = "ValDex-Setup.exe";
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct Update {
@@ -28,16 +34,30 @@ struct Asset {
 }
 
 pub fn available() -> Option<Update> {
-    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(8)).user_agent("ValDex").build().ok()?;
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let response = client.get(url).header("Accept", "application/vnd.github+json").send().ok()?;
-    if !response.status().is_success() {
-        return None;
+    #[cfg(windows)]
+    {
+        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(8)).user_agent("ValDex").build().ok()?;
+        let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let response = client.get(url).header("Accept", "application/vnd.github+json").send().ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        return choose(env!("CARGO_PKG_VERSION"), &response.json().ok()?);
     }
-    choose(env!("CARGO_PKG_VERSION"), &response.json().ok()?)
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 pub fn install(update: &Update) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let _ = update;
+        return Err("This Mac build does not install the Windows setup.".into());
+    }
+    #[cfg(windows)]
+    {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
         .user_agent("ValDex")
@@ -55,6 +75,7 @@ pub fn install(update: &Update) -> Result<(), String> {
     let mut file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
     file.write_all(&bytes).map_err(|error| error.to_string())?;
     schedule(&path)
+    }
 }
 
 fn choose(current: &str, release: &Release) -> Option<Update> {
@@ -79,12 +100,14 @@ fn parts(version: &str) -> [u64; 3] {
     numbers
 }
 
+#[cfg(windows)]
 fn installer_path() -> Result<PathBuf, String> {
     let root = std::env::temp_dir().join("ValDex");
     std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     Ok(root.join(ASSET))
 }
 
+#[cfg(windows)]
 fn schedule(path: &Path) -> Result<(), String> {
     let shown = path.display().to_string().replace('"', "");
     let script = format!("timeout /t 2 /nobreak >nul & start \"\" \"{shown}\"");
