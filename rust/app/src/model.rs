@@ -252,10 +252,11 @@ pub enum Look {
     Forest,
     Sunset,
     Ink,
+    Neon,
 }
 
 impl Look {
-    pub const ALL: [Look; 8] = [Look::Night, Look::Light, Look::Purple, Look::Rose, Look::Ocean, Look::Forest, Look::Sunset, Look::Ink];
+    pub const ALL: [Look; 9] = [Look::Night, Look::Light, Look::Purple, Look::Rose, Look::Ocean, Look::Forest, Look::Sunset, Look::Ink, Look::Neon];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -267,6 +268,7 @@ impl Look {
             Look::Forest => "Forest",
             Look::Sunset => "Sunset",
             Look::Ink => "Ink",
+            Look::Neon => "Neon",
         }
     }
 
@@ -280,6 +282,7 @@ impl Look {
             Look::Forest => "Dark green and a leaf mark.",
             Look::Sunset => "Orange over a late evening.",
             Look::Ink => "Almost black, with a white mark.",
+            Look::Neon => "Black, with a neon green mark.",
         }
     }
 }

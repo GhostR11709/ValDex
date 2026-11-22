@@ -63,6 +63,7 @@ pub fn swatch(look: Look) -> Color {
         Look::Forest => Color::from_rgb8(0x34, 0xd3, 0x99),
         Look::Sunset => Color::from_rgb8(0xfb, 0x92, 0x3c),
         Look::Ink => Color::from_rgb8(0xf4, 0xf4, 0xf5),
+        Look::Neon => Color::from_rgb8(0x39, 0xff, 0x14),
     }
 }
 
@@ -93,6 +94,7 @@ fn backdrop(look: Look) -> iced::gradient::Linear {
         Look::Forest => (Color::from_rgba(0.20, 0.86, 0.55, 0.38), Color::from_rgb8(0x07, 0x14, 0x0e), Color::from_rgba(0.10, 0.45, 0.32, 0.34)),
         Look::Sunset => (Color::from_rgba(1.0, 0.48, 0.16, 0.46), Color::from_rgb8(0x14, 0x0c, 0x08), Color::from_rgba(0.9, 0.25, 0.45, 0.32)),
         Look::Ink => (Color::from_rgba(1.0, 1.0, 1.0, 0.08), Color::from_rgb8(0x0a, 0x0a, 0x0c), Color::from_rgba(1.0, 1.0, 1.0, 0.05)),
+        Look::Neon => (Color::from_rgba(0.22, 1.0, 0.08, 0.55), Color::from_rgb8(0x05, 0x05, 0x05), Color::from_rgba(1.0, 0.12, 0.82, 0.42)),
     };
     let middle = if look == Look::Light { 0.42 } else if look == Look::Night { 0.38 } else { 0.4 };
     iced::gradient::Linear::new(2.4).add_stop(0.0, top).add_stop(middle, mid).add_stop(1.0, bottom)
@@ -268,6 +270,7 @@ fn current() -> Look {
         5 => Look::Forest,
         6 => Look::Sunset,
         7 => Look::Ink,
+        8 => Look::Neon,
         _ => Look::Night,
     }
 }
@@ -282,6 +285,7 @@ fn code(look: Look) -> u8 {
         Look::Forest => 5,
         Look::Sunset => 6,
         Look::Ink => 7,
+        Look::Neon => 8,
     }
 }
 
@@ -294,6 +298,7 @@ fn paint() -> Paint {
         Look::Forest => forest_paint(),
         Look::Sunset => sunset_paint(),
         Look::Ink => ink_paint(),
+        Look::Neon => neon_paint(),
         Look::Night => night_paint(),
     }
 }
@@ -411,6 +416,25 @@ fn ink_paint() -> Paint {
     colors
 }
 
+fn neon_paint() -> Paint {
+    let mut colors = night_paint();
+    let mark = Color::from_rgb8(0x39, 0xff, 0x14);
+    let ink = Color::from_rgb8(0x07, 0x12, 0x07);
+    colors.accent = mark;
+    colors.accent_soft = Color::from_rgba8(0x39, 0xff, 0x14, 0.85);
+    colors.on_accent = ink;
+    colors.purple = Color::from_rgb8(0xff, 0x2b, 0xd6);
+    colors.amber = Color::from_rgb8(0xe8, 0xff, 0x47);
+    colors.surface = Color::from_rgb8(0x10, 0x16, 0x10);
+    colors.play_bg = mark;
+    colors.play_fg = ink;
+    colors.play_hover = Color::from_rgb8(0x2a, 0xd4, 0x00);
+    colors.chip_bg = mark;
+    colors.chip_fg = ink;
+    colors.chip_hover = Color::from_rgb8(0x2a, 0xd4, 0x00);
+    colors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +449,8 @@ mod tests {
         assert_eq!(fg(), Color::from_rgb8(0x1a, 0x0b, 0x12));
         apply(Look::Ocean);
         assert_eq!(highlight(), Color::from_rgb8(0x38, 0xbd, 0xf8));
+        apply(Look::Neon);
+        assert_eq!(highlight(), Color::from_rgb8(0x39, 0xff, 0x14));
         apply(Look::Night);
     }
 }
