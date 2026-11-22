@@ -1,5 +1,6 @@
+use std::path::Path;
 #[cfg(windows)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(windows)]
 use std::process::Command;
 #[cfg(windows)]
@@ -411,12 +412,19 @@ unsafe extern "system" {
     fn UpdateWindow(hwnd: *mut std::ffi::c_void) -> i32;
 }
 
+/// cmd.exe misreads a quoted `start` line handed to it by Rust and then tries to open `\\`.
+/// A batch file is read by cmd itself, so the installer path stays intact.
+fn installer_launch_script(installer: &Path) -> String {
+    let shown = installer.display().to_string().replace('"', "");
+    format!("@echo off\r\nping 127.0.0.1 -n 3 >nul\r\nstart \"\" \"{shown}\"\r\n")
+}
+
 #[cfg(windows)]
 fn schedule(path: &Path) -> Result<(), String> {
-    let shown = path.display().to_string().replace('"', "");
-    let script = format!("timeout /t 2 /nobreak >nul & start \"\" \"{shown}\"");
+    let script_path = path.with_file_name("ValDex-Setup-open.cmd");
+    std::fs::write(&script_path, installer_launch_script(path)).map_err(|error| error.to_string())?;
     Command::new("cmd")
-        .args(["/C", &script])
+        .args(["/D", "/C", &script_path.display().to_string()])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| error.to_string())?;
@@ -455,5 +463,14 @@ mod tests {
     fn the_download_bar_names_how_much_has_arrived() {
         assert_eq!(progress_text(12_400_000, 36_000_000), "12.4 MB of 36.0 MB");
         assert_eq!(progress_text(0, 0), "0 B so far");
+    }
+
+    #[test]
+    fn the_installer_launch_script_keeps_the_setup_path() {
+        let script = installer_launch_script(Path::new(r"C:\Users\Ghost\AppData\Local\Temp\ValDex\ValDex-Setup.exe"));
+        assert_eq!(
+            script,
+            "@echo off\r\nping 127.0.0.1 -n 3 >nul\r\nstart \"\" \"C:\\Users\\Ghost\\AppData\\Local\\Temp\\ValDex\\ValDex-Setup.exe\"\r\n"
+        );
     }
 }
