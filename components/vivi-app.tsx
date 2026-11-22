@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronLeft, Home, Info, Keyboard, Library, Maximize2, Menu, Minimize2, Minus, Search, Square, X } from "lucide-react";
+import { ChevronLeft, Home, Info, Keyboard, Library, Menu, Minimize2, Search } from "lucide-react";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import { CompactStage, NowPlaying, PlayerBar, QueueDrawer } from "@/components/player-chrome";
@@ -9,10 +9,11 @@ import { usePlayer } from "@/components/player-provider";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { CollectionRoute, HomeView, LibraryView, LocalList, LocalPlaylist, SearchView } from "@/components/views";
+import { CollectionRoute, DownloadsView, HomeView, LibraryView, LocalList, LocalPlaylist, SearchView } from "@/components/views";
+import { CATALOGS, catalogLabel, parseSource } from "@/lib/catalog";
 import { getJson } from "@/lib/get-json";
 import { cn } from "@/lib/utils";
-import type { CardItem, Collection, Shelf, Track } from "@/lib/types";
+import type { CardItem, CatalogSource, Collection, Shelf, Track } from "@/lib/types";
 
 const INSTALL_EVENT = "vivi-install-hint";
 
@@ -34,10 +35,11 @@ type Screen =
   | { id: "home" }
   | { id: "search" }
   | { id: "library" }
-  | { id: "album"; browseId: string }
-  | { id: "artist"; browseId: string }
-  | { id: "playlist"; browseId: string }
+  | { id: "album"; browseId: string; source?: CatalogSource }
+  | { id: "artist"; browseId: string; source?: CatalogSource }
+  | { id: "playlist"; browseId: string; source?: CatalogSource }
   | { id: "liked" }
+  | { id: "downloads" }
   | { id: "recents" }
   | { id: "local"; playlistId: string }
   | { id: "now" };
@@ -48,11 +50,16 @@ export function ViviApp() {
   const [stack, setStack] = useState<Screen[]>([{ id: "home" }]);
   const [query, setQuery] = useState("");
   const [mood, setMood] = useState("");
+  const [source, setSource] = useState<CatalogSource>("youtube");
   const [menuOpen, setMenuOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const installHidden = useInstallHidden();
   const searchRef = useRef<HTMLInputElement>(null);
   const screen = stack[stack.length - 1] ?? { id: "home" };
+
+  useEffect(() => {
+    setSource(parseSource(localStorage.getItem("vivi-windows-catalog")));
+  }, []);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -97,6 +104,13 @@ export function ViviApp() {
     return () => window.removeEventListener("keydown", onKey);
   }, [library, player, stack.length]);
 
+  function chooseCatalog(next: CatalogSource) {
+    setSource(next);
+    setMood("");
+    localStorage.setItem("vivi-windows-catalog", next);
+    goPrimary("home");
+  }
+
   function goPrimary(id: "home" | "search" | "library") {
     setStack([{ id }]);
     setMenuOpen(false);
@@ -126,7 +140,7 @@ export function ViviApp() {
     }
     if (card.kind === "song" || card.kind === "video") return;
     try {
-      const data = await getJson<Collection>(`/api/${card.kind}?id=${encodeURIComponent(card.id)}`);
+      const data = await getJson<Collection>(`/api/${card.kind}?source=${card.source || "youtube"}&id=${encodeURIComponent(card.id)}`);
       if (!data.tracks.length) {
         toast.error("That page has no playable songs.");
         return;
@@ -138,24 +152,18 @@ export function ViviApp() {
   }
 
   function openCard(card: CardItem) {
-    if (card.kind === "album") push({ id: "album", browseId: card.id });
-    else if (card.kind === "artist") push({ id: "artist", browseId: card.id });
-    else if (card.kind === "playlist") push({ id: "playlist", browseId: card.id });
+    if (card.kind === "album") push({ id: "album", browseId: card.id, source: card.source });
+    else if (card.kind === "artist") push({ id: "artist", browseId: card.id, source: card.source });
+    else if (card.kind === "playlist") push({ id: "playlist", browseId: card.id, source: card.source });
     else void playCard(card);
   }
 
   const browse = {
     onOpen: openCard,
     onPlay: playCard,
-    onAlbum: (id: string) => push({ id: "album", browseId: id }),
-    onArtist: (id: string) => push({ id: "artist", browseId: id }),
+    onAlbum: (id: string, catalog?: CatalogSource) => push({ id: "album", browseId: id, source: catalog }),
+    onArtist: (id: string, catalog?: CatalogSource) => push({ id: "artist", browseId: id, source: catalog }),
   };
-
-  async function toggleFullScreen() {
-    player.setCompact(false);
-    if (document.fullscreenElement) await document.exitFullscreen();
-    else await document.documentElement.requestFullscreen();
-  }
 
   return (
     <div className="mica flex h-dvh flex-col text-white">
@@ -191,7 +199,7 @@ export function ViviApp() {
               onFocus={() => {
                 if (screen.id !== "search") push({ id: "search" });
               }}
-              placeholder="Search YouTube Music"
+              placeholder={`Search ${catalogLabel(source)}`}
               aria-label="Search YouTube Music"
               className="h-9 rounded-full border-white/10 bg-white/8 pl-9"
             />
@@ -201,29 +209,22 @@ export function ViviApp() {
           <Button type="button" variant="ghost" size="icon-sm" aria-label="Keyboard shortcuts and about" onClick={() => setHelpOpen(true)}>
             <Info />
           </Button>
-          <div className="caption-buttons ml-1 hidden items-stretch sm:flex">
-            <button type="button" className="caption" aria-label="Mini player" onClick={() => player.setCompact(true)}>
-              <Minus className="size-3.5" />
-            </button>
-            <button type="button" className="caption" aria-label="Full screen" onClick={() => void toggleFullScreen()}>
-              {player.compact ? <Maximize2 className="size-3.5" /> : <Square className="size-3" />}
-            </button>
-            <button
-              type="button"
-              className="caption caption-close"
-              aria-label="Close"
-              onClick={() => {
-                window.close();
-                window.setTimeout(() => {
-                  toast("This tab was opened by the browser, so Windows won't let the page close itself. Install Vivi as an app, or close the tab.");
-                }, 200);
-              }}
-            >
-              <X className="size-3.5" />
-            </button>
-          </div>
         </div>
       </header>
+
+      <nav aria-label="Catalog" className="no-drag flex gap-2 overflow-x-auto border-b border-white/8 px-3 py-2">
+        {CATALOGS.map((catalog) => (
+          <button
+            key={catalog.id}
+            type="button"
+            aria-pressed={source === catalog.id}
+            onClick={() => chooseCatalog(catalog.id)}
+            className={cn("shrink-0 rounded-full px-3 py-1 text-sm", source === catalog.id ? "bg-white text-black" : "bg-white/8 text-white/75 hover:bg-white/12")}
+          >
+            {catalog.label}
+          </button>
+        ))}
+      </nav>
 
       {!installHidden && !player.compact ? (
         <div className="flex items-start justify-between gap-3 border-b border-white/8 bg-white/5 px-4 py-2 text-sm text-white/75">
@@ -251,10 +252,13 @@ export function ViviApp() {
         >
           <NavButton icon={<Home />} label="Home" active={screen.id === "home"} onClick={() => goPrimary("home")} />
           <NavButton icon={<Search />} label="Search" active={screen.id === "search"} onClick={() => goPrimary("search")} />
-          <NavButton icon={<Library />} label="Library" active={screen.id === "library" || screen.id === "liked" || screen.id === "local"} onClick={() => goPrimary("library")} />
+          <NavButton icon={<Library />} label="Library" active={screen.id === "library" || screen.id === "liked" || screen.id === "downloads" || screen.id === "local"} onClick={() => goPrimary("library")} />
           <div className="mt-4 px-3 text-xs tracking-wide text-white/35 uppercase">On this PC</div>
           <button type="button" onClick={() => push({ id: "liked" })} className="rounded-xl px-3 py-2 text-left text-sm text-white/75 hover:bg-white/6">
             Liked songs
+          </button>
+          <button type="button" onClick={() => push({ id: "downloads" })} className="rounded-xl px-3 py-2 text-left text-sm text-white/75 hover:bg-white/6">
+            Downloads
           </button>
           <button type="button" onClick={() => push({ id: "recents" })} className="rounded-xl px-3 py-2 text-left text-sm text-white/75 hover:bg-white/6">
             Recently played
@@ -269,25 +273,27 @@ export function ViviApp() {
           {player.compact ? (
             <CompactStage />
           ) : screen.id === "home" ? (
-            <HomeView mood={mood} onMood={setMood} browse={browse} />
+            <HomeView source={source} mood={mood} onMood={setMood} browse={browse} />
           ) : screen.id === "search" ? (
-            <SearchView query={query} onQuery={setQuery} browse={browse} />
+            <SearchView source={source} query={query} onQuery={setQuery} browse={browse} />
           ) : screen.id === "library" ? (
-            <LibraryView onLiked={() => push({ id: "liked" })} onRecents={() => push({ id: "recents" })} onLocal={(id) => push({ id: "local", playlistId: id })} onCreate={() => library.requestPlaylist()} />
+            <LibraryView onLiked={() => push({ id: "liked" })} onDownloads={() => push({ id: "downloads" })} onRecents={() => push({ id: "recents" })} onLocal={(id) => push({ id: "local", playlistId: id })} onCreate={() => library.requestPlaylist()} />
           ) : screen.id === "album" ? (
-            <CollectionRoute kind="album" id={screen.browseId} browse={browse} />
+            <CollectionRoute kind="album" id={screen.browseId} source={screen.source} browse={browse} />
           ) : screen.id === "artist" ? (
-            <CollectionRoute kind="artist" id={screen.browseId} browse={browse} />
+            <CollectionRoute kind="artist" id={screen.browseId} source={screen.source} browse={browse} />
           ) : screen.id === "playlist" ? (
-            <CollectionRoute kind="playlist" id={screen.browseId} browse={browse} />
+            <CollectionRoute kind="playlist" id={screen.browseId} source={screen.source} browse={browse} />
           ) : screen.id === "liked" ? (
             <LocalList title="Liked songs" body="Saved in this browser. Nothing is sent to a Vivi account." tracks={library.liked} browse={browse} onRemove={(track) => library.toggleLike(track)} />
+          ) : screen.id === "downloads" ? (
+            <DownloadsView browse={browse} />
           ) : screen.id === "recents" ? (
             <LocalList title="Recently played" body="The last songs started on this PC." tracks={library.recents} browse={browse} />
           ) : screen.id === "local" ? (
             <LocalPlaylist id={screen.playlistId} browse={browse} />
           ) : (
-            <NowPlaying onAlbum={(id) => push({ id: "album", browseId: id })} onArtist={(id) => push({ id: "artist", browseId: id })} />
+            <NowPlaying onAlbum={(id) => push({ id: "album", browseId: id, source: player.current?.source })} onArtist={(id) => push({ id: "artist", browseId: id, source: player.current?.source })} />
           )}
         </main>
       </div>

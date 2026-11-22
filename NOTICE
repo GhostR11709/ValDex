@@ -1,0 +1,21 @@
+ValDex
+Copyright (C) 2026 ValDex contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version. See the LICENSE file.
+
+ValDex is a Windows player inspired by Vivi Music:
+https://github.com/vivizzz007/vivi-music
+
+Vivi Music is GPL-3.0. Its reuse rules are at:
+https://github.com/vivizzz007/vivi-music/blob/main/rules.md
+
+This repository does not include Vivi Music's Musixmatch lyrics module
+or its JioSaavn streaming module. Those two parts are the modules that
+rules.md tells a reuse to credit inside the app. They are not in ValDex.
+Lyrics here come from LRCLIB, then from YouTube Music.
+
+Vivi Music credits Metrolist by Mostafa Alagamy as the project that
+inspired it: https://github.com/mostafaalagamy/Metrolist

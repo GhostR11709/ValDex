@@ -19,7 +19,7 @@ export function PlayerBar({ onOpenNow }: { onOpenNow: () => void }) {
   const [seeking, setSeeking] = useState(false);
   const [seekValue, setSeekValue] = useState(0);
   const shown = seeking ? seekValue : player.currentTime;
-  const liked = player.current ? library.isLiked(player.current.id) : false;
+  const liked = player.current ? library.isLiked(player.current) : false;
 
   return (
     <footer className="border-t border-white/10 bg-black/55 px-3 pt-1 pb-2 backdrop-blur-xl">

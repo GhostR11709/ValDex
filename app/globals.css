@@ -166,28 +166,10 @@ body {
 }
 
 .no-drag,
-.caption,
 button,
 input,
 a {
   -webkit-app-region: no-drag;
-}
-
-.caption {
-  display: grid;
-  width: 46px;
-  height: 32px;
-  place-items: center;
-  color: white;
-  border-radius: 6px;
-}
-
-.caption:hover {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.caption-close:hover {
-  background: #c42b1c;
 }
 
 .no-scrollbar {
@@ -210,12 +192,6 @@ a {
 .yt-host iframe {
   width: 100% !important;
   height: 100% !important;
-}
-
-@media (display-mode: window-controls-overlay) {
-  .caption-buttons {
-    display: none;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {

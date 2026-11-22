@@ -15,7 +15,15 @@
 
 # next.js
 /.next/
+/.next-release/
 /out/
+
+# one-click test build
+/dist/
+
+# rust build output
+/rust/app/target/
+/rust/launch/target/
 
 # production
 /build

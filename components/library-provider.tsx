@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { sameTrack } from "@/lib/catalog";
 import type { Track, UserPlaylist } from "@/lib/types";
 
 type LibraryState = {
@@ -16,7 +17,7 @@ type LibraryState = {
 
 type LibraryApi = LibraryState & {
   ready: boolean;
-  isLiked: (id: string) => boolean;
+  isLiked: (track: { id: string; source?: Track["source"] }) => boolean;
   toggleLike: (track: Track) => void;
   addRecent: (track: Track) => void;
   rememberSearch: (query: string) => void;
@@ -24,7 +25,7 @@ type LibraryApi = LibraryState & {
   renamePlaylist: (id: string, name: string) => void;
   deletePlaylist: (id: string) => void;
   addToPlaylist: (id: string, track: Track) => void;
-  removeFromPlaylist: (id: string, trackId: string) => void;
+  removeFromPlaylist: (id: string, track: { id: string; source?: Track["source"] }) => void;
 };
 
 const empty: LibraryState = { liked: [], recents: [], playlists: [], searches: [] };
@@ -91,21 +92,21 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
   const [composer, setComposer] = useState<{ track?: Track } | null>(null);
   const [name, setName] = useState("");
 
-  const isLiked = useCallback((id: string) => state.liked.some((track) => track.id === id), [state.liked]);
+  const isLiked = useCallback((track: { id: string; source?: Track["source"] }) => state.liked.some((item) => sameTrack(item, track)), [state.liked]);
 
   const toggleLike = useCallback((track: Track) => {
-    const exists = snapshotLibrary().liked.some((item) => item.id === track.id);
+    const exists = snapshotLibrary().liked.some((item) => sameTrack(item, track));
     toast(exists ? "Removed from liked songs" : "Saved on this PC");
     commitLibrary((current) => ({
       ...current,
-      liked: exists ? current.liked.filter((item) => item.id !== track.id) : [track, ...current.liked].slice(0, 500),
+      liked: exists ? current.liked.filter((item) => !sameTrack(item, track)) : [track, ...current.liked].slice(0, 500),
     }));
   }, []);
 
   const addRecent = useCallback((track: Track) => {
     commitLibrary((current) => ({
       ...current,
-      recents: [track, ...current.recents.filter((item) => item.id !== track.id)].slice(0, 40),
+      recents: [track, ...current.recents.filter((item) => !sameTrack(item, track))].slice(0, 40),
     }));
   }, []);
 
@@ -141,7 +142,7 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
     commitLibrary((current) => ({
       ...current,
       playlists: current.playlists.map((playlist) =>
-        playlist.id === id && !playlist.tracks.some((item) => item.id === track.id)
+        playlist.id === id && !playlist.tracks.some((item) => sameTrack(item, track))
           ? { ...playlist, tracks: [...playlist.tracks, track] }
           : playlist,
       ),
@@ -149,11 +150,11 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
     toast("Added to the playlist");
   }, []);
 
-  const removeFromPlaylist = useCallback((id: string, trackId: string) => {
+  const removeFromPlaylist = useCallback((id: string, track: { id: string; source?: Track["source"] }) => {
     commitLibrary((current) => ({
       ...current,
       playlists: current.playlists.map((playlist) =>
-        playlist.id === id ? { ...playlist, tracks: playlist.tracks.filter((track) => track.id !== trackId) } : playlist,
+        playlist.id === id ? { ...playlist, tracks: playlist.tracks.filter((item) => !sameTrack(item, track)) } : playlist,
       ),
     }));
   }, []);

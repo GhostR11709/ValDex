@@ -1,5 +1,12 @@
 import type { Track } from "./types";
 
+export function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  const megabytes = bytes / (1024 * 1024);
+  if (megabytes < 0.1) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${megabytes >= 10 ? megabytes.toFixed(0) : megabytes.toFixed(1)} MB`;
+}
+
 export function formatTime(seconds?: number) {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "0:00";
   const total = Math.floor(seconds);

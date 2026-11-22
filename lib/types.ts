@@ -1,3 +1,5 @@
+export type CatalogSource = "youtube" | "soundcloud" | "audius" | "archive";
+
 export type Person = {
   name: string;
   id?: string;
@@ -5,6 +7,7 @@ export type Person = {
 
 export type Track = {
   id: string;
+  source?: CatalogSource;
   title: string;
   artists: Person[];
   album?: { name: string; id?: string };
@@ -17,6 +20,7 @@ export type CardKind = "song" | "video" | "album" | "playlist" | "artist";
 export type CardItem = {
   kind: CardKind;
   id: string;
+  source?: CatalogSource;
   title: string;
   subtitle: string;
   thumbnail: string;

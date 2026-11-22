@@ -4,6 +4,8 @@ import { createContext, useContext, useEffect, useRef, useState, useSyncExternal
 import { toast } from "sonner";
 import { companionColor, sampleAccent } from "@/components/color";
 import { useLibrary } from "@/components/library-provider";
+import { catalogOf, streamQuery } from "@/lib/catalog";
+import { readDownloadAudio } from "@/lib/downloads";
 import { artistLine } from "@/lib/format";
 import { getJson } from "@/lib/get-json";
 import type { PlaybackPayload, Track } from "@/lib/types";
@@ -158,6 +160,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const pendingRef = useRef<string | null>(null);
   const readyRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const hlsRef = useRef<{ destroy: () => void } | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<YTPlayer | null>(null);
@@ -283,7 +287,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const onError = () => {
       if (engineRef.current !== "audio" || Date.now() - loadedAt.current < 400) return;
       const track = currentRef.current;
-      if (track) playEmbedRef.current(track.id);
+      if (hlsRef.current) return;
+      if (track && catalogOf(track) === "youtube") playEmbedRef.current(track.id);
+      else {
+        setPlaying(false);
+        setBuffering(false);
+        setError("This recording didn't start.");
+      }
     };
     audio.addEventListener("timeupdate", onTime);
     audio.addEventListener("play", onPlay);
@@ -429,12 +439,31 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     recentRef.current(track);
   }
 
+  function releaseObjectUrl() {
+    if (!objectUrlRef.current) return;
+    URL.revokeObjectURL(objectUrlRef.current);
+    objectUrlRef.current = null;
+  }
+
+  function stopHls() {
+    const hls = hlsRef.current;
+    hlsRef.current = null;
+    if (!hls) return;
+    try {
+      hls.destroy();
+    } catch {
+      /* already gone */
+    }
+  }
+
   function silenceAudio() {
+    stopHls();
     const audio = audioRef.current;
     if (!audio) return;
     audio.pause();
     audio.removeAttribute("src");
     audio.load();
+    releaseObjectUrl();
   }
 
   function silenceEmbed() {
@@ -497,10 +526,55 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     setDuration(track.duration || 0);
     timeRef.current = 0;
     durationRef.current = track.duration || 0;
-    // Start the official player in this click, before the network round trip,
-    // so Windows treats it as a user gesture.
-    playEmbed(track.id);
+    // YouTube's embed has to start in this click, before any network wait,
+    // so Windows treats it as a user gesture. Other catalogs play the file directly.
+    const source = catalogOf(track);
+    if (source === "youtube") playEmbed(track.id);
     try {
+      const local = await readDownloadAudio(track);
+      if (tokenRef.current !== token) return;
+      if (local) {
+        const audio = audioRef.current;
+        if (!audio) throw new Error("Audio element missing");
+        silenceEmbed();
+        ensureAnalyser();
+        void audioContextRef.current?.resume();
+        engineRef.current = "audio";
+        setEngine("audio");
+        releaseObjectUrl();
+        const url = URL.createObjectURL(local);
+        objectUrlRef.current = url;
+        audio.src = url;
+        try {
+          await audio.play();
+        } catch {
+          if (source === "youtube") playEmbed(track.id);
+          else setPlaying(false);
+        }
+        return;
+      }
+      if (source === "soundcloud") {
+        await playSoundcloud(track, token);
+        return;
+      }
+      if (source !== "youtube") {
+        const audio = audioRef.current;
+        if (!audio) throw new Error("Audio element missing");
+        silenceEmbed();
+        ensureAnalyser();
+        void audioContextRef.current?.resume();
+        engineRef.current = "audio";
+        setEngine("audio");
+        releaseObjectUrl();
+        loadedAt.current = Date.now();
+        audio.src = `/api/stream?${streamQuery(track)}`;
+        try {
+          await audio.play();
+        } catch {
+          setPlaying(false);
+        }
+        return;
+      }
       const playback = await getJson<PlaybackPayload>(`/api/playback?id=${encodeURIComponent(track.id)}`);
       if (tokenRef.current !== token) return;
       if (playback.mode === "audio") {
@@ -511,6 +585,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         void audioContextRef.current?.resume();
         engineRef.current = "audio";
         setEngine("audio");
+        releaseObjectUrl();
         audio.src = `/api/stream?id=${encodeURIComponent(track.id)}`;
         try {
           await audio.play();
@@ -520,9 +595,62 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       }
     } catch (loadError) {
       if (tokenRef.current !== token) return;
-      if (!(loadError instanceof Error) || !/official player|Direct audio/.test(loadError.message)) {
-        setError("Trying the YouTube player for this track.");
+      const message = loadError instanceof Error ? loadError.message : "";
+      if (source === "youtube") {
+        if (!/official player|Direct audio/.test(message)) setError("Trying the YouTube player for this track.");
+        return;
       }
+      setPlaying(false);
+      setBuffering(false);
+      setError(message && message.length < 160 ? message : "This recording didn't start.");
+    }
+  }
+
+  async function playSoundcloud(track: Track, token: number) {
+    const playback = await getJson<PlaybackPayload>(`/api/playback?${streamQuery(track)}`);
+    if (tokenRef.current !== token) return;
+    const audio = audioRef.current;
+    if (!audio) throw new Error("Audio element missing");
+    silenceEmbed();
+    stopHls();
+    ensureAnalyser();
+    void audioContextRef.current?.resume();
+    engineRef.current = "audio";
+    setEngine("audio");
+    releaseObjectUrl();
+    loadedAt.current = Date.now();
+    setBuffering(true);
+    if (playback.mode === "audio") {
+      audio.src = `/api/stream?${streamQuery(track)}`;
+      try {
+        await audio.play();
+      } catch {
+        setPlaying(false);
+      }
+      return;
+    }
+    const { default: Hls } = await import("hls.js");
+    if (tokenRef.current !== token) return;
+    if (!Hls.isSupported()) throw new Error("This browser can't play SoundCloud.");
+    const hls = new Hls({ enableWorker: false });
+    hlsRef.current = hls;
+    await new Promise<void>((resolve, reject) => {
+      hls.on(Hls.Events.MANIFEST_PARSED, () => resolve());
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal || tokenRef.current !== token) return;
+        setPlaying(false);
+        setBuffering(false);
+        setError("This recording didn't start.");
+        reject(new Error("This recording didn't start."));
+      });
+      hls.loadSource(`/api/stream?${streamQuery(track)}`);
+      hls.attachMedia(audio);
+    });
+    if (tokenRef.current !== token) return;
+    try {
+      await audio.play();
+    } catch {
+      setPlaying(false);
     }
   }
 
@@ -537,7 +665,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   async function extendRadio() {
     if (radioLock.current) return;
     const track = currentRef.current;
-    if (!track) return;
+    if (!track || catalogOf(track) !== "youtube") {
+      setPlaying(false);
+      return;
+    }
     radioLock.current = true;
     try {
       const data = await getJson<{ tracks: Track[] }>(`/api/radio?id=${encodeURIComponent(track.id)}`);
@@ -647,7 +778,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   loadRef.current = load;
 
   function playTracks(tracks: Track[], start = 0) {
-    const playable = tracks.filter((track) => /^[\w-]{11}$/.test(track.id));
+    const playable = tracks.filter((track) => (catalogOf(track) === "youtube" ? /^[\w-]{11}$/.test(track.id) : Boolean(track.id)));
     if (!playable.length) {
       toast.error("Nothing in that list can be played.");
       return;

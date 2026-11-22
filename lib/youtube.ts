@@ -1,4 +1,4 @@
-import { Innertube } from "youtubei.js";
+import { Constants, Innertube, Platform } from "youtubei.js";
 import type { CardItem, CardKind, Collection, HomePayload, Person, SearchPayload, Shelf, Track } from "./types";
 
 // Catalog access for the Windows client. Uses youtubei.js (MIT).
@@ -28,12 +28,21 @@ type Loose = {
   footer?: unknown;
 };
 
-const CLIENTS = ["IOS", "ANDROID", "TV", "WEB"] as const;
+const CLIENTS = ["ANDROID", "MWEB", "YTMUSIC", "IOS", "WEB"] as const;
+const STREAM_USER_AGENT = "Mozilla/5.0";
+
+// The library extracts YouTube's player script and needs a runtime to run that script.
+Platform.shim.eval = (data, env) => {
+  void env;
+  return new Function(data.output)();
+};
 
 let ytPromise: Promise<Innertube> | null = null;
 let tail: Promise<unknown> = Promise.resolve();
 let audioBlockedUntil = 0;
-const streamCache = new Map<string, { url: string; mime: string; expires: number }>();
+export type ResolvedAudio = { url: string; mime: string; userAgent: string; contentLength: number };
+
+const streamCache = new Map<string, ResolvedAudio & { expires: number }>();
 
 function getYt() {
   if (!ytPromise) {
@@ -156,6 +165,7 @@ function mapTrack(item: Loose, fallback?: Partial<Track>): Track | null {
   const artists = peopleOf(source);
   return {
     id,
+    source: "youtube",
     title,
     artists: artists.length ? artists : fallback?.artists || [],
     album: source.album?.name ? { name: source.album.name, id: source.album.id } : fallback?.album,
@@ -173,6 +183,7 @@ function mapCard(item: Loose): CardItem | null {
   return {
     kind,
     id,
+    source: "youtube",
     title: asText(item.title) || asText(item.name) || "Untitled",
     subtitle: asText(item.subtitle) || artists.map((artist) => artist.name).join(", "),
     thumbnail: bestThumb(item.thumbnails ?? item.thumbnail),
@@ -184,8 +195,10 @@ function dedupeTracks(tracks: Array<Track | null | undefined>) {
   const seen = new Set<string>();
   const out: Track[] = [];
   for (const track of tracks) {
-    if (!track || seen.has(track.id)) continue;
-    seen.add(track.id);
+    if (!track) continue;
+    const key = `${track.source || "youtube"}:${track.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     out.push(track);
   }
   return out;
@@ -202,6 +215,53 @@ function dedupeCards(cards: Array<CardItem | null | undefined>) {
     out.push(card);
   }
   return out;
+}
+
+function personName(value: unknown) {
+  if (!value) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "object" && "name" in value) {
+    const name = (value as { name?: unknown }).name;
+    if (typeof name === "string") return name.trim();
+    return asText(name);
+  }
+  return asText(value);
+}
+
+function videoCard(item: Loose): CardItem | null {
+  const id = item.video_id || (/^[\w-]{11}$/.test(item.id || "") ? item.id : "") || "";
+  const title = asText(item.title);
+  if (!id || !title) return null;
+  const author = personName((item as { author?: unknown }).author);
+  const seconds = item.duration?.seconds;
+  const thumbnail = bestThumb(item.thumbnails ?? item.thumbnail);
+  const track: Track = {
+    id,
+    source: "youtube",
+    title,
+    artists: author ? [{ name: author }] : [],
+    duration: typeof seconds === "number" && seconds > 0 ? seconds : undefined,
+    thumbnail,
+  };
+  return { kind: "video", id, source: "youtube", title, subtitle: author, thumbnail, track };
+}
+
+function songLength(cards: CardItem[]) {
+  const songs = cards.filter((card) => {
+    const seconds = card.track?.duration;
+    return typeof seconds === "number" && seconds >= 45 && seconds <= 480;
+  });
+  return (songs.length >= 6 ? songs : cards).slice(0, 12);
+}
+
+async function youtubeVideoShelf(yt: Innertube, title: string, query: string): Promise<Shelf | null> {
+  const found = await yt.search(query, { type: "video", duration: "three_to_twenty_mins" });
+  const songs = dedupeCards(list(found.videos).map((item) => videoCard(item))).slice(0, 12);
+  if (songs.length >= 4) return { title, items: songs };
+  const open = await yt.search(query, { type: "video" });
+  const items = songLength(dedupeCards(list(open.videos).map((item) => videoCard(item))));
+  if (!items.length) return null;
+  return { title, items };
 }
 
 function shelfOf(section: Loose, titleFrom: "header" | "title"): Shelf | null {
@@ -245,38 +305,67 @@ export function isAllowedMediaHost(url: string) {
   }
 }
 
+const HOME_FALLBACK = [
+  { title: "New music", query: "new music" },
+  { title: "Top songs", query: "top songs" },
+  { title: "Chill", query: "chill music" },
+];
+
+function shelfParserMissed(error: unknown) {
+  return error instanceof Error && /Expected node of any type/.test(error.message);
+}
+
+async function fallbackHome(yt: Innertube): Promise<HomePayload> {
+  const shelves = (await Promise.all(HOME_FALLBACK.map((shelf) => youtubeVideoShelf(yt, shelf.title, shelf.query)))).filter((shelf): shelf is Shelf => Boolean(shelf));
+  if (!shelves.length) throw new Error("YouTube Music isn't available on this network.");
+  return { filters: [], shelves };
+}
+
 export async function getHome(mood?: string): Promise<HomePayload> {
   return withYt(async (yt) => {
-    let home = await yt.music.getHomeFeed();
-    const filters = [...(home.filters || [])];
-    if (mood && filters.includes(mood)) {
-      try {
-        home = await home.applyFilter(mood);
-      } catch (error) {
-        console.error(error);
+    try {
+      let home = await yt.music.getHomeFeed();
+      const filters = [...(home.filters || [])];
+      if (mood && filters.includes(mood)) {
+        try {
+          home = await home.applyFilter(mood);
+        } catch (error) {
+          console.error(error);
+        }
       }
+      const shelves = list(home.sections)
+        .filter((section) => section.type === "MusicCarouselShelf")
+        .map((section) => shelfOf(section, "header"))
+        .filter((shelf): shelf is Shelf => Boolean(shelf));
+      if (shelves.length) return { filters, shelves };
+    } catch (error) {
+      if (!shelfParserMissed(error)) throw error;
     }
-    const shelves = list(home.sections)
-      .filter((section) => section.type === "MusicCarouselShelf")
-      .map((section) => shelfOf(section, "header"))
-      .filter((shelf): shelf is Shelf => Boolean(shelf));
-    return { filters, shelves };
+    return fallbackHome(yt);
   });
 }
 
 export async function searchCatalog(query: string): Promise<SearchPayload> {
   return withYt(async (yt) => {
-    const result = await yt.music.search(query);
-    const shelves = [result.songs, result.videos, result.albums, result.artists, result.playlists, ...list(result.contents)];
-    const cards = dedupeCards(shelves.flatMap((shelf) => list((shelf as Loose | undefined)?.contents).map((item) => mapCard(item))));
+    let cards: CardItem[] = [];
+    try {
+      const result = await yt.music.search(query);
+      const shelves = [result.songs, result.videos, result.albums, result.artists, result.playlists, ...list(result.contents)];
+      cards = dedupeCards(shelves.flatMap((shelf) => list((shelf as Loose | undefined)?.contents).map((item) => mapCard(item))));
+    } catch (error) {
+      if (!shelfParserMissed(error)) throw error;
+    }
     const take = (kind: CardKind) => cards.filter((card) => card.kind === kind);
-    return {
+    const payload: SearchPayload = {
       songs: dedupeTracks(take("song").map((card) => card.track)),
       videos: dedupeTracks(take("video").map((card) => card.track)),
       albums: take("album"),
       artists: take("artist"),
       playlists: take("playlist"),
     };
+    if (payload.songs.length || payload.videos.length) return payload;
+    const web = await yt.search(query, { type: "video" });
+    return { songs: [], videos: dedupeTracks(list(web.videos).map((item) => videoCard(item)?.track)), albums: [], artists: [], playlists: [] };
   });
 }
 
@@ -404,31 +493,106 @@ export async function getPlainLyrics(videoId: string) {
   });
 }
 
-export async function resolveAudio(videoId: string) {
+export function youtubeFetchHeaders(userAgent: string, range?: string | null) {
+  const headers = new Headers();
+  headers.set("user-agent", userAgent || STREAM_USER_AGENT);
+  headers.set("accept", "*/*");
+  headers.set("origin", "https://www.youtube.com");
+  headers.set("referer", "https://www.youtube.com");
+  if (range) headers.set("range", range);
+  return headers;
+}
+
+export async function resolveAudio(videoId: string): Promise<ResolvedAudio | null> {
   const cached = streamCache.get(videoId);
-  if (cached && cached.expires > Date.now()) return { url: cached.url, mime: cached.mime };
+  if (cached && cached.expires > Date.now()) {
+    return { url: cached.url, mime: cached.mime, userAgent: cached.userAgent, contentLength: cached.contentLength };
+  }
   if (audioBlockedUntil > Date.now()) return null;
   return withYt(async (yt) => {
+    let blocked = true;
     for (const client of CLIENTS) {
       try {
         const info = await yt.getBasicInfo(videoId, { client });
-        if (info.playability_status?.status === "LOGIN_REQUIRED") {
-          audioBlockedUntil = Date.now() + 10 * 60 * 1000;
-          return null;
+        const status = info.playability_status?.status;
+        if (status === "LOGIN_REQUIRED") continue;
+        blocked = false;
+        if (status && status !== "OK") continue;
+        const userAgent = clientUserAgent(client);
+        for (const format of listedFormats(info)) {
+          if (!format.url && !format.signature_cipher && !format.cipher) continue;
+          const url = await format.decipher(yt.session.player);
+          if (!url || !isAllowedMediaHost(url)) continue;
+          let contentLength = format.content_length || 0;
+          if (contentLength < 2048) contentLength = await measuredLength(url, userAgent);
+          if (contentLength < 2048) continue;
+          const mime = (format.mime_type || "audio/mp4").split(";")[0];
+          if (!(await servesWholeFile(url, contentLength, userAgent))) continue;
+          const audio = { url, mime, userAgent, contentLength };
+          streamCache.set(videoId, { ...audio, expires: Date.now() + 2 * 60 * 60 * 1000 });
+          return audio;
         }
-        if (info.playability_status?.status && info.playability_status.status !== "OK") continue;
-        const format = info.chooseFormat({ type: "audio", quality: "best" });
-        const url = await format.decipher(yt.session.player);
-        if (!url || !isAllowedMediaHost(url)) continue;
-        const mime = format.mime_type || "audio/mp4";
-        streamCache.set(videoId, { url, mime, expires: Date.now() + 2 * 60 * 60 * 1000 });
-        return { url, mime };
       } catch (error) {
+        blocked = false;
         console.error(client, error instanceof Error ? error.message : error);
       }
     }
+    if (blocked) audioBlockedUntil = Date.now() + 10 * 60 * 1000;
     return null;
   });
+}
+
+function clientUserAgent(client: (typeof CLIENTS)[number]) {
+  const record = Constants.CLIENTS[client] as { USER_AGENT?: string };
+  return record.USER_AGENT || STREAM_USER_AGENT;
+}
+
+function listedFormats(info: Awaited<ReturnType<Innertube["getBasicInfo"]>>) {
+  const audio = [...(info.streaming_data?.adaptive_formats || [])].filter((format) => format.has_audio && !format.has_video && (format.content_length || 0) > 0);
+  const progressive = [...(info.streaming_data?.formats || [])].filter((format) => format.has_audio && (format.mime_type || "").startsWith("video/mp4") && ((format.content_length || 0) > 0 || Boolean(format.url || format.signature_cipher || format.cipher)));
+  audio.sort((left, right) => (right.bitrate || 0) - (left.bitrate || 0));
+  progressive.sort((left, right) => (right.bitrate || 0) - (left.bitrate || 0));
+  return [...progressive, ...(audio[0] ? [audio[0]] : [])];
+}
+
+async function measuredLength(url: string, userAgent: string) {
+  const response = await openMedia(url, youtubeFetchHeaders(userAgent, "bytes=0-1"), 0, AbortSignal.timeout(8000));
+  const fromRange = rangeTotal(response.headers.get("content-range"));
+  const fromLength = Number(response.headers.get("content-length") || 0);
+  await response.body?.cancel().catch(() => undefined);
+  if (fromRange >= 2048) return fromRange;
+  if (response.status === 200 && fromLength >= 2048) return fromLength;
+  return 0;
+}
+
+function rangeTotal(header: string | null) {
+  const match = header?.match(/\/(\d+)\s*$/);
+  return match ? Number(match[1]) : 0;
+}
+
+async function servesWholeFile(url: string, contentLength: number, userAgent: string) {
+  const start = Math.max(0, contentLength - 1024);
+  const response = await openMedia(url, youtubeFetchHeaders(userAgent, `bytes=${start}-${contentLength - 1}`), 0, AbortSignal.timeout(8000));
+  if (response.status !== 200 && response.status !== 206) {
+    await response.body?.cancel();
+    return false;
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return false;
+  const first = await reader.read();
+  await reader.cancel();
+  return Boolean(first.value && first.value.byteLength > 0);
+}
+
+async function openMedia(url: string, headers: Headers, hops = 0, signal?: AbortSignal): Promise<Response> {
+  if (!isAllowedMediaHost(url)) throw new Error("The audio host was not recognized.");
+  const response = await fetch(url, { headers, redirect: "manual", signal });
+  if ([301, 302, 303, 307, 308].includes(response.status)) {
+    const location = response.headers.get("location");
+    if (!location || hops > 3) throw new Error("The audio host was not recognized.");
+    return openMedia(new URL(location, url).toString(), headers, hops + 1, signal);
+  }
+  return response;
 }
 
 export function dropCachedAudio(videoId: string) {

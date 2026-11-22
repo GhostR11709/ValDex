@@ -9,9 +9,11 @@ import { usePlayer } from "@/components/player-provider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { artistLine, greetingFor, shuffleTracks } from "@/lib/format";
+import { useDownloads } from "@/lib/downloads";
+import { catalogBlurb, catalogLabel, sameTrack } from "@/lib/catalog";
+import { artistLine, formatBytes, greetingFor, shuffleTracks } from "@/lib/format";
 import { getJson } from "@/lib/get-json";
-import type { CardItem, Collection, HomePayload, SearchPayload, Shelf, Track } from "@/lib/types";
+import type { CardItem, CatalogSource, Collection, HomePayload, SearchPayload, Shelf, Track } from "@/lib/types";
 
 function useRemote<T>(path: string | null) {
   const [result, setResult] = useState<{ path: string; data: T | null; error: string } | null>(null);
@@ -51,21 +53,31 @@ function useGreeting() {
 type BrowseHandlers = {
   onOpen: (card: CardItem) => void;
   onPlay: (card: CardItem, shelf?: Shelf) => void;
-  onAlbum: (id: string) => void;
-  onArtist: (id: string) => void;
+  onAlbum: (id: string, source?: CatalogSource) => void;
+  onArtist: (id: string, source?: CatalogSource) => void;
 };
 
-export function HomeView({ mood, onMood, browse }: { mood: string; onMood: (mood: string) => void; browse: BrowseHandlers }) {
+export function HomeView({
+  source,
+  mood,
+  onMood,
+  browse,
+}: {
+  source: CatalogSource;
+  mood: string;
+  onMood: (mood: string) => void;
+  browse: BrowseHandlers;
+}) {
   const [attempt, setAttempt] = useState(0);
   const greeting = useGreeting();
-  const path = `${mood ? `/api/home?mood=${encodeURIComponent(mood)}` : "/api/home"}${attempt ? `${mood ? "&" : "?"}retry=${attempt}` : ""}`;
+  const path = `/api/home?source=${source}${mood ? `&mood=${encodeURIComponent(mood)}` : ""}${attempt ? `&retry=${attempt}` : ""}`;
   const { data, error, loading } = useRemote<HomePayload>(path);
 
   if (loading && !data) return <LoadingBlock label="Loading home" />;
   if (error && !data) {
     return (
       <EmptyState
-        title="YouTube Music didn't answer"
+        title={`${catalogLabel(source)} didn't answer`}
         body={error}
         action={
           <Button type="button" onClick={() => setAttempt((value) => value + 1)}>
@@ -81,9 +93,7 @@ export function HomeView({ mood, onMood, browse }: { mood: string; onMood: (mood
       <header className="space-y-3">
         <p className="text-sm text-white/50">Windows 11 edition</p>
         <h1 className="text-4xl font-semibold tracking-tight">{greeting}</h1>
-        <p className="max-w-xl text-sm leading-6 text-white/60">
-          Shelves come from YouTube Music. Songs you heart, and playlists you make, stay in this browser on this PC.
-        </p>
+        <p className="max-w-xl text-sm leading-6 text-white/60">{catalogBlurb(source)}</p>
         <div className="flex flex-wrap gap-2 pt-1">
           {(data?.filters || []).map((filter) => (
             <button
@@ -103,17 +113,19 @@ export function HomeView({ mood, onMood, browse }: { mood: string; onMood: (mood
           <ShelfRow key={shelf.title} shelf={shelf} onOpen={browse.onOpen} onPlay={(card) => browse.onPlay(card, shelf)} />
         ))
       ) : (
-        <EmptyState title="This mood is quiet" body="YouTube Music didn't send any shelves. Try another mood, or search for something specific." />
+        <EmptyState title="Nothing on this shelf" body={`${catalogLabel(source)} didn't send any music. Try another filter, or search for something specific.`} />
       )}
     </div>
   );
 }
 
 export function SearchView({
+  source,
   query,
   onQuery,
   browse,
 }: {
+  source: CatalogSource;
   query: string;
   onQuery: (query: string) => void;
   browse: BrowseHandlers;
@@ -122,7 +134,7 @@ export function SearchView({
   const rememberSearch = library.rememberSearch;
   const [attempt, setAttempt] = useState(0);
   const trimmed = query.trim();
-  const requestKey = trimmed.length < 2 ? "" : `${trimmed}\n${attempt}`;
+  const requestKey = trimmed.length < 2 ? "" : `${source}\n${trimmed}\n${attempt}`;
   const [result, setResult] = useState<{ key: string; data: SearchPayload | null; suggestions: string[]; error: string } | null>(null);
 
   useEffect(() => {
@@ -133,8 +145,10 @@ export function SearchView({
       rememberSearch(trimmed);
       const encoded = encodeURIComponent(trimmed);
       Promise.all([
-        getJson<SearchPayload>(`/api/search?q=${encoded}`, controller.signal),
-        getJson<string[]>(`/api/suggest?q=${encoded}`, controller.signal).catch(() => [] as string[]),
+        getJson<SearchPayload>(`/api/search?source=${source}&q=${encoded}`, controller.signal),
+        source === "youtube"
+          ? getJson<string[]>(`/api/suggest?q=${encoded}`, controller.signal).catch(() => [] as string[])
+          : Promise.resolve([] as string[]),
       ])
         .then(([data, suggestions]) => {
           if (active) setResult({ key: requestKey, data, suggestions, error: "" });
@@ -149,7 +163,7 @@ export function SearchView({
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [requestKey, rememberSearch, trimmed]);
+  }, [requestKey, rememberSearch, source, trimmed]);
 
   const matched = result?.key === requestKey ? result : null;
   const data = matched?.data ?? null;
@@ -161,7 +175,7 @@ export function SearchView({
     return (
       <div className="space-y-6">
         <h1 className="text-3xl font-semibold tracking-tight">Search</h1>
-        <p className="max-w-lg text-sm leading-6 text-white/60">Look up a song, an album, an artist, or a playlist from YouTube Music.</p>
+        <p className="max-w-lg text-sm leading-6 text-white/60">Look up a song, an album, an artist, or a playlist on {catalogLabel(source)}.</p>
         {library.searches.length ? (
           <div className="flex flex-wrap gap-2">
             {library.searches.map((item) => (
@@ -181,6 +195,7 @@ export function SearchView({
   return (
     <div className="space-y-5">
       <h1 className="text-3xl font-semibold tracking-tight">Results for “{query}”</h1>
+      <p className="text-sm text-white/45">{catalogLabel(source)}</p>
       {suggestions.length ? (
         <div className="flex flex-wrap gap-2">
           {suggestions.map((item) => (
@@ -235,10 +250,10 @@ export function TrackList({ tracks, browse, onRemove }: { tracks: Track[]; brows
           key={`${track.id}-${index}`}
           track={track}
           position={index + 1}
-          active={player.current?.id === track.id}
+          active={player.current ? sameTrack(player.current, track) : false}
           onPlay={() => player.playTracks(tracks, index)}
-          onAlbum={track.album?.id ? () => browse.onAlbum(track.album!.id!) : undefined}
-          onArtist={track.artists.find((artist) => artist.id) ? () => browse.onArtist(track.artists.find((artist) => artist.id)!.id!) : undefined}
+          onAlbum={track.album?.id ? () => browse.onAlbum(track.album!.id!, track.source) : undefined}
+          onArtist={track.artists.find((artist) => artist.id) ? () => browse.onArtist(track.artists.find((artist) => artist.id)!.id!, track.source) : undefined}
           onRemove={onRemove ? () => onRemove(track) : undefined}
         />
       ))}
@@ -246,17 +261,27 @@ export function TrackList({ tracks, browse, onRemove }: { tracks: Track[]; brows
   );
 }
 
-export function CollectionRoute({ kind, id, browse }: { kind: "album" | "playlist" | "artist"; id: string; browse: BrowseHandlers }) {
+export function CollectionRoute({
+  kind,
+  id,
+  source = "youtube",
+  browse,
+}: {
+  kind: "album" | "playlist" | "artist";
+  id: string;
+  source?: CatalogSource;
+  browse: BrowseHandlers;
+}) {
   const player = usePlayer();
   const [attempt, setAttempt] = useState(0);
-  const { data, error, loading } = useRemote<Collection>(`/api/${kind}?id=${encodeURIComponent(id)}${attempt ? `&retry=${attempt}` : ""}`);
+  const { data, error, loading } = useRemote<Collection>(`/api/${kind}?source=${source}&id=${encodeURIComponent(id)}${attempt ? `&retry=${attempt}` : ""}`);
 
   if (loading && !data) return <LoadingBlock label="Loading" />;
   if (error || !data) {
     return (
       <EmptyState
         title="That page didn't open"
-        body={error || "YouTube Music sent back an empty page."}
+        body={error || `${catalogLabel(source)} sent back an empty page.`}
         action={
           <Button type="button" onClick={() => setAttempt((value) => value + 1)}>
             Try again
@@ -285,7 +310,7 @@ export function CollectionRoute({ kind, id, browse }: { kind: "album" | "playlis
           </div>
         </div>
       </header>
-      {data.tracks.length ? <TrackList tracks={data.tracks} browse={browse} /> : <EmptyState title="No songs on this page" body="The page opened, but YouTube Music didn't list tracks that can be played." />}
+      {data.tracks.length ? <TrackList tracks={data.tracks} browse={browse} /> : <EmptyState title="No songs on this page" body={`The page opened, but ${catalogLabel(source)} didn't list tracks that can be played.`} />}
       {data.shelves?.map((shelf) => (
         <ShelfRow key={shelf.title} shelf={shelf} onOpen={browse.onOpen} onPlay={(card) => browse.onPlay(card, shelf)} />
       ))}
@@ -295,31 +320,40 @@ export function CollectionRoute({ kind, id, browse }: { kind: "album" | "playlis
 
 export function LibraryView({
   onLiked,
+  onDownloads,
   onRecents,
   onLocal,
   onCreate,
 }: {
   onLiked: () => void;
+  onDownloads: () => void;
   onRecents: () => void;
   onLocal: (id: string) => void;
   onCreate: () => void;
 }) {
   const library = useLibrary();
+  const downloads = useDownloads();
+  const downloadBytes = downloads.items.reduce((sum, item) => sum + item.bytes, 0);
   return (
     <div className="space-y-8">
       <header className="flex items-end justify-between gap-4">
         <div>
           <h1 className="text-4xl font-semibold tracking-tight">Library</h1>
-          <p className="mt-2 max-w-lg text-sm leading-6 text-white/60">Liked songs and playlists are stored on this PC, in this browser. Clearing site data removes them.</p>
+          <p className="mt-2 max-w-lg text-sm leading-6 text-white/60">Liked songs, playlists, and downloads stay on this PC, in this browser. Clearing site data removes them.</p>
         </div>
         <Button type="button" className="rounded-full" onClick={onCreate}>
           New playlist
         </Button>
       </header>
-      <div className="grid gap-3 sm:grid-cols-2">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <button type="button" onClick={onLiked} className="rounded-3xl bg-gradient-to-br from-[var(--vivi)] to-fuchsia-950 p-5 text-left">
           <p className="text-sm text-white/80">Liked songs</p>
           <p className="mt-6 text-2xl font-semibold">{library.liked.length}</p>
+        </button>
+        <button type="button" onClick={onDownloads} className="rounded-3xl bg-white/8 p-5 text-left hover:bg-white/10">
+          <p className="text-sm text-white/60">Downloads</p>
+          <p className="mt-6 text-2xl font-semibold">{downloads.items.length}</p>
+          <p className="truncate text-sm text-white/50">{downloads.items.length ? formatBytes(downloadBytes) : "Save a song from its menu."}</p>
         </button>
         <button type="button" onClick={onRecents} className="rounded-3xl bg-white/8 p-5 text-left hover:bg-white/10">
           <p className="text-sm text-white/60">Recently played</p>
@@ -353,6 +387,8 @@ export function LocalList({
   browse,
   onRemove,
   header,
+  emptyTitle,
+  emptyBody,
 }: {
   title: string;
   body: string;
@@ -360,6 +396,8 @@ export function LocalList({
   browse: BrowseHandlers;
   onRemove?: (track: Track) => void;
   header?: React.ReactNode;
+  emptyTitle?: string;
+  emptyBody?: string;
 }) {
   const player = usePlayer();
   return (
@@ -372,8 +410,29 @@ export function LocalList({
           <Play className="fill-current" /> Play
         </Button>
       </header>
-      {tracks.length ? <TrackList tracks={tracks} browse={browse} onRemove={onRemove} /> : <EmptyState title="Nothing saved here" body="When you heart a song or add it to a playlist, it stays on this PC." />}
+      {tracks.length ? (
+        <TrackList tracks={tracks} browse={browse} onRemove={onRemove} />
+      ) : (
+        <EmptyState title={emptyTitle ?? "Nothing saved here"} body={emptyBody ?? "When you heart a song or add it to a playlist, it stays on this PC."} />
+      )}
     </div>
+  );
+}
+
+export function DownloadsView({ browse }: { browse: BrowseHandlers }) {
+  const downloads = useDownloads();
+  const tracks = downloads.items.map((item) => item.track);
+  const bytes = downloads.items.reduce((sum, item) => sum + item.bytes, 0);
+  return (
+    <LocalList
+      title="Downloads"
+      body={tracks.length ? `${tracks.length} saved in this browser · ${formatBytes(bytes)}. Play works without asking YouTube again.` : "Songs you download stay in this browser on this PC."}
+      tracks={tracks}
+      browse={browse}
+      onRemove={(track) => void downloads.remove(track.id)}
+      emptyTitle="No downloads yet"
+      emptyBody="Open the menu on a song and choose Download. The file stays on this PC."
+    />
   );
 }
 
@@ -400,7 +459,7 @@ function LocalPlaylistEditor({
       body="This playlist lives only in this browser."
       tracks={playlist.tracks}
       browse={browse}
-      onRemove={(track) => library.removeFromPlaylist(playlist.id, track.id)}
+      onRemove={(track) => library.removeFromPlaylist(playlist.id, track)}
       header={
         <div className="flex max-w-md flex-col gap-2 sm:flex-row">
           <Input value={name} aria-label="Playlist name" onChange={(event) => setName(event.target.value)} />

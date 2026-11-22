@@ -15,6 +15,9 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useLibrary } from "@/components/library-provider";
 import { usePlayer } from "@/components/player-provider";
+import { useDownloads } from "@/lib/downloads";
+import { catalogLabel, catalogOf } from "@/lib/catalog";
+import { downloadKey } from "@/lib/downloads";
 import { artistLine, formatTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { CardItem, Shelf, Track } from "@/lib/types";
@@ -103,7 +106,7 @@ export function TrackRow({
   onRemove?: () => void;
 }) {
   const library = useLibrary();
-  const liked = library.isLiked(track.id);
+  const liked = library.isLiked(track);
   return (
     <div
       className={cn(
@@ -119,7 +122,10 @@ export function TrackRow({
         <Cover src={track.thumbnail} alt="" className="size-11 rounded-lg" />
         <span className="min-w-0">
           <span className={cn("block truncate text-sm font-medium", active && "text-[var(--vivi)]")}>{track.title}</span>
-          <span className="block truncate text-xs text-white/50">{artistLine(track)}</span>
+          <span className="block truncate text-xs text-white/50">
+            {artistLine(track)}
+            {catalogOf(track) === "youtube" ? "" : ` · ${catalogLabel(catalogOf(track))}`}
+          </span>
         </span>
       </button>
       <button type="button" onClick={onAlbum} className="hidden truncate text-left text-sm text-white/45 hover:text-white sm:block" disabled={!onAlbum}>
@@ -149,6 +155,9 @@ function TrackMenu({
 }) {
   const player = usePlayer();
   const library = useLibrary();
+  const downloads = useDownloads();
+  const saved = downloads.isDownloaded(track);
+  const busy = downloads.isBusy(track);
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -160,7 +169,19 @@ function TrackMenu({
         <DropdownMenuItem onSelect={() => player.playNext(track)}>Play next</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => player.enqueue(track)}>Add to queue</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => library.toggleLike(track)}>
-          {library.isLiked(track.id) ? "Remove from liked" : "Save to liked songs"}
+          {library.isLiked(track) ? "Remove from liked" : "Save to liked songs"}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={busy}
+          onSelect={() => {
+            if (saved) {
+              const item = downloads.items.find((entry) => entry.id === downloadKey(track) || entry.track.id === track.id);
+              void downloads.remove(item?.id || downloadKey(track));
+            }
+            else void downloads.download(track);
+          }}
+        >
+          {busy ? "Downloading…" : saved ? "Remove download" : "Download"}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuSub>

@@ -12,7 +12,7 @@ export async function respond(work: () => Promise<unknown>) {
 
 function withTimeout<T>(promise: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("YouTube Music took too long to answer.")), ms);
+    const timer = setTimeout(() => reject(new Error("The catalog took too long to answer.")), Math.max(ms, 30000));
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -32,7 +32,7 @@ export function jsonError(error: unknown, status?: number) {
   const friendly =
     message && message.length < 160 && !/innertube|https?:\/\//i.test(message) && !message.includes("\n")
       ? message
-      : "YouTube Music didn't answer. Try again in a moment.";
+      : "That didn't work. Try again in a moment.";
   const code = status ?? (/doesn't look right|Type a|Missing/.test(friendly) ? 400 : 502);
   return Response.json({ error: friendly }, { status: code, headers: { "cache-control": "no-store" } });
 }
