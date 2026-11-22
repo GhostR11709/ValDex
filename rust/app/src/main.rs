@@ -10,6 +10,11 @@ mod session;
 #[cfg(not(windows))]
 #[path = "session_stub.rs"]
 mod session;
+#[cfg(windows)]
+mod discord;
+#[cfg(not(windows))]
+#[path = "discord_stub.rs"]
+mod discord;
 mod press;
 mod songfile;
 mod style;
@@ -88,6 +93,7 @@ struct App {
     pending: HashSet<String>,
     seek_hold: Instant,
     session: Option<session::Session>,
+    discord: discord::Presence,
     look: Look,
     pending_seek: Option<f32>,
     restore_once: bool,
@@ -245,6 +251,7 @@ impl App {
             pending: HashSet::new(),
             seek_hold: Instant::now(),
             session: None,
+            discord: discord::Presence::start(),
             look,
             pending_seek: None,
             restore_once: false,
@@ -1706,6 +1713,7 @@ impl App {
             if let Some(session) = self.session.as_mut() {
                 session.clear();
             }
+            self.discord.clear();
             return;
         };
         if self.session.is_none() {
@@ -1722,6 +1730,9 @@ impl App {
         if let Some(session) = self.session.as_mut() {
             session.show(&track, playing, position, art.as_deref());
         }
+        let duration = track.duration.unwrap_or(0) as f32;
+        let image = remote::absolute_media(&track.thumbnail).unwrap_or_default();
+        self.discord.show(&track.title, &track.artist(), &image, playing, position, duration);
     }
 
     fn media(&mut self, command: session::Command) -> Task<Message> {

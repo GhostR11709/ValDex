@@ -2,7 +2,7 @@
 AppId={{7C4E9A2B-1D58-4F63-A0E7-6B91C3D84F20}
 AppName=ValDex
 ; Keep this equal to the version in rust/launch/Cargo.toml.
-AppVersion=0.1.2
+AppVersion=0.1.3
 AppPublisher=ValDex
 DefaultDirName={localappdata}\ValDex
 DisableDirPage=yes
